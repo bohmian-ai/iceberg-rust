@@ -55,7 +55,9 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod maintenance;
 mod rewrite;
+mod rewrite_manifests;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -68,6 +70,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
+pub use maintenance::{CleanupTraversalLimits, ExpiredFileSet, expired_files_between};
+pub use rewrite::RewriteFilesAction;
+pub use rewrite_manifests::{
+    ManifestRewriteLimits, ManifestRewriteOutcome, ManifestRewriteResult, ManifestRewriteSelection,
+    rewrite_manifests,
+};
 pub use update_schema::AddColumn;
 
 use crate::error::Result;
@@ -76,7 +84,6 @@ use crate::table::Table;
 use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
-pub use rewrite::RewriteFilesAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;

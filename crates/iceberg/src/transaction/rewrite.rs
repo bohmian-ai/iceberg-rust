@@ -111,7 +111,9 @@ impl SnapshotProduceOperation for RewriteOperation {
         let mut removed_found = 0_usize;
 
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(producer.table.file_io()).await?;
+            let manifest = manifest_file
+                .load_manifest(producer.table.file_io())
+                .await?;
             if !manifest_touches(&manifest, &self.removed) {
                 continue;
             }
@@ -162,7 +164,9 @@ impl SnapshotProduceOperation for RewriteOperation {
             {
                 continue;
             }
-            let manifest = manifest_file.load_manifest(producer.table.file_io()).await?;
+            let manifest = manifest_file
+                .load_manifest(producer.table.file_io())
+                .await?;
             if !manifest_touches(&manifest, &self.removed) {
                 kept.push(manifest_file.clone());
             }

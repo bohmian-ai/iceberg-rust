@@ -342,6 +342,44 @@ impl<'a> SnapshotProducer<'a> {
         writer.write_manifest_file().await
     }
 
+    /// Writes rewritten entries into content-compatible manifests.
+    async fn write_rewritten_manifests(
+        &mut self,
+        entries: Vec<ManifestEntry>,
+    ) -> Result<Vec<ManifestFile>> {
+        let mut data_writer = None;
+        let mut delete_writer = None;
+        for entry in entries {
+            let writer = match entry.data_file().content_type() {
+                crate::spec::DataContentType::Data => {
+                    if data_writer.is_none() {
+                        data_writer = Some(self.new_manifest_writer(ManifestContentType::Data)?);
+                    }
+                    data_writer.as_mut()
+                }
+                crate::spec::DataContentType::PositionDeletes
+                | crate::spec::DataContentType::EqualityDeletes => {
+                    if delete_writer.is_none() {
+                        delete_writer =
+                            Some(self.new_manifest_writer(ManifestContentType::Deletes)?);
+                    }
+                    delete_writer.as_mut()
+                }
+            };
+            writer
+                .expect("invariant: matching manifest writer was initialized")
+                .add_entry(entry)?;
+        }
+        let mut manifests = Vec::new();
+        if let Some(writer) = data_writer {
+            manifests.push(writer.write_manifest_file().await?);
+        }
+        if let Some(writer) = delete_writer {
+            manifests.push(writer.write_manifest_file().await?);
+        }
+        Ok(manifests)
+    }
+
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -362,14 +400,14 @@ impl<'a> SnapshotProducer<'a> {
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
 
+        let rewritten_entries = snapshot_produce_operation.delete_entries(self).await?;
+        manifest_files.extend(self.write_rewritten_manifests(rewritten_entries).await?);
+
         // Process added entries.
         if !self.added_data_files.is_empty() {
             let added_manifest = self.write_added_manifest().await?;
             manifest_files.push(added_manifest);
         }
-
-        // # TODO
-        // Support process delete entries.
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
