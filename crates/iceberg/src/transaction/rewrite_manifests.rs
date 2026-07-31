@@ -171,8 +171,8 @@ impl SnapshotProduceOperation for RewriteManifestOperation {
             .map(|entry| {
                 ManifestEntry::builder()
                     .status(ManifestStatus::Existing)
-                    .snapshot_id(producer.snapshot_id())
-                    .sequence_number(entry.sequence_number().unwrap_or(0))
+                    .snapshot_id_opt(entry.snapshot_id)
+                    .sequence_number_opt(entry.sequence_number)
                     .file_sequence_number_opt(entry.file_sequence_number)
                     .data_file(entry.data_file().clone())
                     .build()
@@ -274,7 +274,10 @@ pub async fn rewrite_manifests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TableUpdate;
     use crate::catalog::MockCatalog;
+    use crate::spec::{DataContentType, SnapshotRef};
+    use crate::transaction::append::tests::make_table_with_delete_only_manifest;
     use crate::transaction::tests::make_v2_minimal_table;
 
     #[tokio::test]
@@ -297,5 +300,165 @@ mod tests {
         assert_eq!(result.outcome, ManifestRewriteOutcome::NoOp);
         assert!(result.rewritten_manifest_paths.is_empty());
         assert_eq!(result.table.metadata(), table.metadata());
+    }
+
+    #[tokio::test]
+    async fn rewrite_manifests_preserves_live_entry_provenance_and_membership() {
+        let (table, _temp_dir, delete_only_path) = make_table_with_delete_only_manifest().await;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let selected = list
+            .entries()
+            .iter()
+            .find(|manifest| manifest.manifest_path != delete_only_path)
+            .unwrap();
+        let original_manifest = selected.load_manifest(table.file_io()).await.unwrap();
+        let original = original_manifest
+            .entries()
+            .iter()
+            .find(|entry| entry.is_alive())
+            .unwrap();
+
+        let action = RewriteManifestsAction {
+            selected: HashSet::from([selected.manifest_path.clone()]),
+            limits: ManifestRewriteLimits {
+                max_manifests: 1,
+                max_entries: 8,
+                max_bytes: u64::MAX,
+            },
+            commit_uuid: Uuid::now_v7(),
+        };
+        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = commit.take_updates();
+        let rewritten_snapshot = updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(SnapshotRef::new(snapshot.clone())),
+                _ => None,
+            })
+            .unwrap();
+        let rewritten_list = table
+            .manifest_list_reader(&rewritten_snapshot)
+            .load()
+            .await
+            .unwrap();
+        assert!(
+            rewritten_list
+                .entries()
+                .iter()
+                .any(|manifest| manifest.manifest_path == delete_only_path)
+        );
+        let rewritten_manifest_file = rewritten_list
+            .entries()
+            .iter()
+            .find(|manifest| manifest.manifest_path != delete_only_path)
+            .unwrap();
+        assert_eq!(rewritten_manifest_file.content, selected.content);
+        let rewritten_manifest = rewritten_manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .unwrap();
+        let rewritten = rewritten_manifest
+            .entries()
+            .iter()
+            .find(|entry| entry.is_alive())
+            .unwrap();
+        assert_eq!(rewritten.file_path(), original.file_path());
+        assert_eq!(rewritten.content_type(), DataContentType::Data);
+        assert_eq!(rewritten.snapshot_id(), original.snapshot_id());
+        assert_eq!(rewritten.sequence_number(), original.sequence_number());
+        assert_eq!(
+            rewritten.file_sequence_number,
+            original.file_sequence_number
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_manifests_enforces_nonzero_manifest_bounds() {
+        let (table, _temp_dir, _) = make_table_with_delete_only_manifest().await;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let selected: HashSet<String> = list
+            .entries()
+            .iter()
+            .map(|m| m.manifest_path.clone())
+            .collect();
+        let action = RewriteManifestsAction {
+            selected,
+            limits: ManifestRewriteLimits {
+                max_manifests: 1,
+                max_entries: usize::MAX,
+                max_bytes: u64::MAX,
+            },
+            commit_uuid: Uuid::now_v7(),
+        };
+        let error = Arc::new(action).commit(&table).await.err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[tokio::test]
+    async fn rewrite_manifests_returns_stale_catalog_table_without_commit() {
+        let (table, _temp_dir, _) = make_table_with_delete_only_manifest().await;
+        let stale = make_v2_minimal_table();
+        let mut catalog = MockCatalog::new();
+        catalog.expect_load_table().times(1).returning_st(move |_| {
+            let stale = stale.clone();
+            Box::pin(async move { Ok(stale) })
+        });
+        let result = rewrite_manifests(
+            &catalog,
+            &table,
+            ManifestRewriteSelection {
+                manifest_paths: vec!["missing".to_string()],
+            },
+            ManifestRewriteLimits {
+                max_manifests: 1,
+                max_entries: 1,
+                max_bytes: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, ManifestRewriteOutcome::Stale);
+        assert!(result.rewritten_manifest_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rewrite_manifests_returns_exact_table_from_committed_catalog_update() {
+        let (table, _temp_dir, _) = make_table_with_delete_only_manifest().await;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let selected = list.entries()[0].manifest_path.clone();
+        let loaded = table.clone();
+        let committed = table.clone();
+        let mut catalog = MockCatalog::new();
+        catalog.expect_load_table().times(2).returning_st(move |_| {
+            let loaded = loaded.clone();
+            Box::pin(async move { Ok(loaded) })
+        });
+        catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(move |_| {
+                let committed = committed.clone();
+                Box::pin(async move { Ok(committed) })
+            });
+        let result = rewrite_manifests(
+            &catalog,
+            &table,
+            ManifestRewriteSelection {
+                manifest_paths: vec![selected.clone(), selected.clone()],
+            },
+            ManifestRewriteLimits {
+                max_manifests: 1,
+                max_entries: 8,
+                max_bytes: u64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, ManifestRewriteOutcome::Rewritten);
+        assert_eq!(result.rewritten_manifest_paths, vec![selected]);
+        assert_eq!(result.table.metadata_location(), table.metadata_location());
     }
 }

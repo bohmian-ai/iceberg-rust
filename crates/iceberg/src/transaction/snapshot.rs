@@ -373,7 +373,7 @@ impl<'a> SnapshotProducer<'a> {
             };
             writer
                 .expect("invariant: matching manifest writer was initialized")
-                .add_entry(entry)?;
+                .add_existing_entry(entry)?;
         }
         let mut manifests = Vec::new();
         if let Some(writer) = data_writer {

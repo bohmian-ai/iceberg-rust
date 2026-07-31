@@ -174,3 +174,55 @@ impl SnapshotProduceOperation for RewriteOperation {
         Ok(kept)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::TableUpdate;
+    use crate::spec::SnapshotRef;
+    use crate::transaction::TransactionAction;
+    use crate::transaction::append::tests::make_table_with_delete_only_manifest;
+
+    #[tokio::test]
+    async fn rewrite_files_action_does_not_materialize_manifest_rewrite_entries() {
+        let (table, _temp_dir, delete_only_path) = make_table_with_delete_only_manifest().await;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snapshot).load().await.unwrap();
+        let data_manifest = list
+            .entries()
+            .iter()
+            .find(|m| m.manifest_path != delete_only_path)
+            .unwrap();
+        let data_path = data_manifest
+            .load_manifest(table.file_io())
+            .await
+            .unwrap()
+            .entries()[0]
+            .file_path()
+            .to_string();
+        let action = RewriteFilesAction::new()
+            .delete_files([data_path])
+            .set_snapshot_properties(HashMap::from([(
+                "rewrite-files-regression".to_string(),
+                "true".to_string(),
+            )]));
+        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = commit.take_updates();
+        let new_snapshot = updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(SnapshotRef::new(snapshot.clone())),
+                _ => None,
+            })
+            .unwrap();
+        let rewritten_list = table
+            .manifest_list_reader(&new_snapshot)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(rewritten_list.entries().len(), 1);
+        assert_eq!(rewritten_list.entries()[0].manifest_path, delete_only_path);
+    }
+}
