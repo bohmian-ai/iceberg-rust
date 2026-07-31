@@ -158,6 +158,10 @@ impl SnapshotProduceOperation for RewriteManifestOperation {
         Operation::Replace
     }
 
+    fn rewrite_entries(&self) -> bool {
+        true
+    }
+
     async fn delete_entries(&self, producer: &SnapshotProducer<'_>) -> Result<Vec<ManifestEntry>> {
         let manifests = selected_manifests(self, producer).await?;
         Ok(manifests

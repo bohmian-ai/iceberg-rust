@@ -68,6 +68,11 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
 
+    /// Whether `delete_entries` supplies entries for replacement manifests.
+    fn rewrite_entries(&self) -> bool {
+        false
+    }
+
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
     #[allow(unused)]
     fn delete_entries(
@@ -400,8 +405,10 @@ impl<'a> SnapshotProducer<'a> {
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
 
-        let rewritten_entries = snapshot_produce_operation.delete_entries(self).await?;
-        manifest_files.extend(self.write_rewritten_manifests(rewritten_entries).await?);
+        if snapshot_produce_operation.rewrite_entries() {
+            let rewritten_entries = snapshot_produce_operation.delete_entries(self).await?;
+            manifest_files.extend(self.write_rewritten_manifests(rewritten_entries).await?);
+        }
 
         // Process added entries.
         if !self.added_data_files.is_empty() {
