@@ -136,7 +136,7 @@ impl TableProvider for IcebergTableProvider {
             table,
             None, // Always use current snapshot for catalog-backed provider
             self.schema.clone(),
-            projection,
+            projection.map(Vec::as_slice),
             filters,
             limit,
         )))
@@ -316,7 +316,7 @@ impl TableProvider for IcebergStaticTableProvider {
             self.table.clone(),
             self.snapshot_id,
             self.schema.clone(),
-            projection,
+            projection.map(Vec::as_slice),
             filters,
             limit,
         )))
