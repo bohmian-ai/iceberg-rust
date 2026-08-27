@@ -90,6 +90,20 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// which is stored in the snapshot metadata for tracking and auditing purposes.
     fn operation(&self) -> Operation;
 
+    /// Whether `delete_entries` supplies entries for *replacement* manifests
+    /// rather than deletions.
+    ///
+    /// An exact-selection manifest rewrite carries its live entries forward
+    /// unchanged and only replaces the manifest objects that hold them. Those
+    /// entries must be written as `Existing`, preserving their snapshot,
+    /// sequence, and file-sequence provenance, instead of being written as
+    /// `Deleted`. Returning `true` routes `delete_entries` through
+    /// [`SnapshotProducer::write_rewritten_manifests`]; the default `false`
+    /// keeps the ordinary delete path.
+    fn rewrite_entries(&self) -> bool {
+        false
+    }
+
     /// Returns manifest entries that should be marked as deleted in the new snapshot.
     #[allow(unused)]
     fn delete_entries(
@@ -587,6 +601,50 @@ impl<'a> SnapshotProducer<'a> {
         Ok(manifests)
     }
 
+    /// Writes carried-forward entries into fresh, content- and spec-compatible manifests.
+    ///
+    /// This is the replacement half of an exact-selection manifest rewrite: the
+    /// selected manifest objects are dropped from the new snapshot's manifest
+    /// list and their live entries are re-emitted here as `Existing` entries, so
+    /// the live file set, provenance, and sequence numbers are byte-for-byte
+    /// unchanged while the physical manifest objects are new. Entries are
+    /// grouped by `(partition_spec_id, content)` so a rewrite never merges data
+    /// and delete content or crosses a partition spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a manifest writer cannot be created for a group's
+    /// spec/content pair, an entry cannot be appended, or writing a replacement
+    /// manifest object fails.
+    async fn write_rewritten_manifests(
+        &self,
+        entries: Vec<ManifestEntry>,
+    ) -> Result<Vec<ManifestFile>> {
+        let mut groups: HashMap<(i32, ManifestContentType), Vec<ManifestEntry>> = HashMap::new();
+        for entry in entries {
+            let content = match entry.content_type() {
+                DataContentType::Data => ManifestContentType::Data,
+                DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
+                    ManifestContentType::Deletes
+                }
+            };
+            groups
+                .entry((entry.data_file().partition_spec_id, content))
+                .or_default()
+                .push(entry);
+        }
+
+        let mut manifests = Vec::with_capacity(groups.len());
+        for ((spec_id, content), entries) in groups {
+            let mut writer = self.new_manifest_writer(content, spec_id)?;
+            for entry in entries {
+                writer.add_existing_entry(entry)?;
+            }
+            manifests.push(writer.write_manifest_file().await?);
+        }
+        Ok(manifests)
+    }
+
     pub(crate) async fn prepare_manifests<OP: SnapshotProduceOperation, MP: ManifestProcess>(
         &mut self,
         snapshot_produce_operation: &OP,
@@ -680,8 +738,12 @@ impl<'a> SnapshotProducer<'a> {
             manifest_files.push(added_manifest);
         }
 
-        let deleted_entries = snapshot_produce_operation.delete_entries(self).await?;
-        manifest_files.extend(self.write_delete_manifests(deleted_entries).await?);
+        let operation_entries = snapshot_produce_operation.delete_entries(self).await?;
+        if snapshot_produce_operation.rewrite_entries() {
+            manifest_files.extend(self.write_rewritten_manifests(operation_entries).await?);
+        } else {
+            manifest_files.extend(self.write_delete_manifests(operation_entries).await?);
+        }
 
         if snapshot_produce_operation.operation() == Operation::Overwrite {
             manifest_files = self.merge_data_manifests(manifest_files).await?;

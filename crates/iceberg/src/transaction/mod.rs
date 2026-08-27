@@ -55,6 +55,7 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod maintenance;
 mod manifest_filter;
 mod replace_files;
 mod rewrite_manifests;
@@ -71,9 +72,13 @@ use std::time::Duration;
 
 pub use append::FastAppendAction;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
+pub use maintenance::{CleanupTraversalLimits, ExpiredFileSet, expired_files_between};
 pub use manifest_filter::{ManifestFilterManager, ManifestWriterContext};
 pub use replace_files::{OverwriteFilesAction, RewriteFilesAction};
-pub use rewrite_manifests::RewriteManifestsAction;
+pub use rewrite_manifests::{
+    ManifestRewriteLimits, ManifestRewriteOutcome, ManifestRewriteResult, ManifestRewriteSelection,
+    RewriteManifestsAction, rewrite_manifests,
+};
 pub use update_schema::AddColumn;
 
 use crate::error::Result;
@@ -235,6 +240,31 @@ impl Transaction {
         .when(|e| e.retryable())
         .await
         .1
+    }
+
+    /// Commit the transaction with exactly one catalog update attempt.
+    ///
+    /// This preserves retryable catalog errors for callers that must reconcile
+    /// an accepted-but-uncertain commit before deciding whether a retry is safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table is encrypted, an action cannot produce
+    /// its updates, a requirement fails, or the single catalog update fails.
+    pub async fn commit_once(mut self, catalog: &dyn Catalog) -> Result<Table> {
+        if self.actions.is_empty() {
+            return Ok(self.table);
+        }
+
+        let table_props = self.table.metadata().table_properties()?;
+        if table_props.encryption_key_id.is_some() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Cannot commit to an encrypted table: encrypted writes are not yet supported",
+            ));
+        }
+
+        self.do_commit(catalog).await
     }
 
     fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
@@ -648,6 +678,22 @@ mod tests {
 
         // Verify the result
         assert!(result.is_ok(), "Transaction should eventually succeed");
+    }
+
+    #[tokio::test]
+    async fn test_commit_once_does_not_retry_retryable_error() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table);
+        let mock_catalog = setup_mock_catalog_with_retryable_errors(None, 1);
+
+        let error = tx
+            .commit_once(&mock_catalog)
+            .await
+            .expect_err("single-attempt commit must return the first catalog error");
+
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+        assert_eq!(error.message(), "Commit conflict");
+        assert!(error.retryable());
     }
 
     #[tokio::test]

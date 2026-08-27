@@ -3386,6 +3386,19 @@ pub fn iceberg::test_utils::check_record_batches(record_batches: alloc::vec::Vec
 pub async fn iceberg::test_utils::make_encrypted_table() -> iceberg::table::Table
 pub fn iceberg::test_utils::test_runtime() -> iceberg::Runtime
 pub mod iceberg::transaction
+pub enum iceberg::transaction::ManifestRewriteOutcome
+pub iceberg::transaction::ManifestRewriteOutcome::NoOp
+pub iceberg::transaction::ManifestRewriteOutcome::Rewritten
+pub iceberg::transaction::ManifestRewriteOutcome::Stale
+impl core::clone::Clone for iceberg::transaction::ManifestRewriteOutcome
+pub fn iceberg::transaction::ManifestRewriteOutcome::clone(&self) -> iceberg::transaction::ManifestRewriteOutcome
+impl core::cmp::Eq for iceberg::transaction::ManifestRewriteOutcome
+impl core::cmp::PartialEq for iceberg::transaction::ManifestRewriteOutcome
+pub fn iceberg::transaction::ManifestRewriteOutcome::eq(&self, other: &iceberg::transaction::ManifestRewriteOutcome) -> bool
+impl core::fmt::Debug for iceberg::transaction::ManifestRewriteOutcome
+pub fn iceberg::transaction::ManifestRewriteOutcome::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for iceberg::transaction::ManifestRewriteOutcome
+impl core::marker::StructuralPartialEq for iceberg::transaction::ManifestRewriteOutcome
 pub struct iceberg::transaction::ActionCommit
 impl iceberg::transaction::ActionCommit
 pub fn iceberg::transaction::ActionCommit::new(updates: alloc::vec::Vec<iceberg::TableUpdate>, requirements: alloc::vec::Vec<iceberg::TableRequirement>) -> Self
@@ -3397,6 +3410,36 @@ pub fn iceberg::transaction::AddColumn::optional(name: impl alloc::string::ToStr
 pub fn iceberg::transaction::AddColumn::required(name: impl alloc::string::ToString, field_type: iceberg::spec::Type, initial_default: iceberg::spec::Literal) -> Self
 impl iceberg::transaction::AddColumn
 pub fn iceberg::transaction::AddColumn::builder() -> AddColumnBuilder<((), (), (), (), (), (), ())>
+pub struct iceberg::transaction::CleanupTraversalLimits
+pub iceberg::transaction::CleanupTraversalLimits::max_bytes: u64
+pub iceberg::transaction::CleanupTraversalLimits::max_items: usize
+impl core::clone::Clone for iceberg::transaction::CleanupTraversalLimits
+pub fn iceberg::transaction::CleanupTraversalLimits::clone(&self) -> iceberg::transaction::CleanupTraversalLimits
+impl core::cmp::Eq for iceberg::transaction::CleanupTraversalLimits
+impl core::cmp::PartialEq for iceberg::transaction::CleanupTraversalLimits
+pub fn iceberg::transaction::CleanupTraversalLimits::eq(&self, other: &iceberg::transaction::CleanupTraversalLimits) -> bool
+impl core::fmt::Debug for iceberg::transaction::CleanupTraversalLimits
+pub fn iceberg::transaction::CleanupTraversalLimits::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for iceberg::transaction::CleanupTraversalLimits
+impl core::marker::StructuralPartialEq for iceberg::transaction::CleanupTraversalLimits
+pub struct iceberg::transaction::ExpiredFileSet
+pub iceberg::transaction::ExpiredFileSet::data_files: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::ExpiredFileSet::delete_files: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::ExpiredFileSet::limit_exhausted: bool
+pub iceberg::transaction::ExpiredFileSet::manifest_lists: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::ExpiredFileSet::manifests: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::ExpiredFileSet::metadata_logs: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::ExpiredFileSet::statistics: std::collections::hash::set::HashSet<alloc::string::String>
+impl core::clone::Clone for iceberg::transaction::ExpiredFileSet
+pub fn iceberg::transaction::ExpiredFileSet::clone(&self) -> iceberg::transaction::ExpiredFileSet
+impl core::cmp::Eq for iceberg::transaction::ExpiredFileSet
+impl core::cmp::PartialEq for iceberg::transaction::ExpiredFileSet
+pub fn iceberg::transaction::ExpiredFileSet::eq(&self, other: &iceberg::transaction::ExpiredFileSet) -> bool
+impl core::default::Default for iceberg::transaction::ExpiredFileSet
+pub fn iceberg::transaction::ExpiredFileSet::default() -> iceberg::transaction::ExpiredFileSet
+impl core::fmt::Debug for iceberg::transaction::ExpiredFileSet
+pub fn iceberg::transaction::ExpiredFileSet::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg::transaction::ExpiredFileSet
 pub struct iceberg::transaction::FastAppendAction
 impl iceberg::transaction::FastAppendAction
 pub fn iceberg::transaction::FastAppendAction::add_data_files(self, data_files: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::DataFile>) -> Self
@@ -3416,6 +3459,35 @@ pub fn iceberg::transaction::ManifestFilterManager::fail_missing_delete_paths(se
 pub fn iceberg::transaction::ManifestFilterManager::files_to_be_deleted(&self) -> alloc::vec::Vec<&iceberg::spec::DataFile>
 pub async fn iceberg::transaction::ManifestFilterManager::filter_manifests(&mut self, table_schema: &iceberg::spec::Schema, manifests: alloc::vec::Vec<iceberg::spec::ManifestFile>) -> iceberg::Result<alloc::vec::Vec<iceberg::spec::ManifestFile>>
 pub fn iceberg::transaction::ManifestFilterManager::new(file_io: iceberg::io::FileIO, writer_context: iceberg::transaction::ManifestWriterContext) -> Self
+pub struct iceberg::transaction::ManifestRewriteLimits
+pub iceberg::transaction::ManifestRewriteLimits::max_bytes: u64
+pub iceberg::transaction::ManifestRewriteLimits::max_entries: usize
+pub iceberg::transaction::ManifestRewriteLimits::max_manifests: usize
+impl core::clone::Clone for iceberg::transaction::ManifestRewriteLimits
+pub fn iceberg::transaction::ManifestRewriteLimits::clone(&self) -> iceberg::transaction::ManifestRewriteLimits
+impl core::cmp::Eq for iceberg::transaction::ManifestRewriteLimits
+impl core::cmp::PartialEq for iceberg::transaction::ManifestRewriteLimits
+pub fn iceberg::transaction::ManifestRewriteLimits::eq(&self, other: &iceberg::transaction::ManifestRewriteLimits) -> bool
+impl core::fmt::Debug for iceberg::transaction::ManifestRewriteLimits
+pub fn iceberg::transaction::ManifestRewriteLimits::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for iceberg::transaction::ManifestRewriteLimits
+impl core::marker::StructuralPartialEq for iceberg::transaction::ManifestRewriteLimits
+pub struct iceberg::transaction::ManifestRewriteResult
+pub iceberg::transaction::ManifestRewriteResult::outcome: iceberg::transaction::ManifestRewriteOutcome
+pub iceberg::transaction::ManifestRewriteResult::rewritten_manifest_paths: alloc::vec::Vec<alloc::string::String>
+pub iceberg::transaction::ManifestRewriteResult::table: iceberg::table::Table
+impl core::clone::Clone for iceberg::transaction::ManifestRewriteResult
+pub fn iceberg::transaction::ManifestRewriteResult::clone(&self) -> iceberg::transaction::ManifestRewriteResult
+pub struct iceberg::transaction::ManifestRewriteSelection
+pub iceberg::transaction::ManifestRewriteSelection::manifest_paths: alloc::vec::Vec<alloc::string::String>
+impl core::clone::Clone for iceberg::transaction::ManifestRewriteSelection
+pub fn iceberg::transaction::ManifestRewriteSelection::clone(&self) -> iceberg::transaction::ManifestRewriteSelection
+impl core::cmp::Eq for iceberg::transaction::ManifestRewriteSelection
+impl core::cmp::PartialEq for iceberg::transaction::ManifestRewriteSelection
+pub fn iceberg::transaction::ManifestRewriteSelection::eq(&self, other: &iceberg::transaction::ManifestRewriteSelection) -> bool
+impl core::fmt::Debug for iceberg::transaction::ManifestRewriteSelection
+pub fn iceberg::transaction::ManifestRewriteSelection::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg::transaction::ManifestRewriteSelection
 pub struct iceberg::transaction::ManifestWriterContext
 impl iceberg::transaction::ManifestWriterContext
 pub fn iceberg::transaction::ManifestWriterContext::new(metadata_location: alloc::string::String, commit_uuid: uuid::Uuid, manifest_counter: alloc::sync::Arc<core::sync::atomic::AtomicU64>, format_version: iceberg::spec::FormatVersion, snapshot_id: i64, file_io: iceberg::io::FileIO, encryption_manager: core::option::Option<alloc::sync::Arc<iceberg::encryption::EncryptionManager>>) -> Self
@@ -3436,6 +3508,7 @@ pub fn iceberg::transaction::RewriteManifestsAction::default() -> Self
 pub struct iceberg::transaction::Transaction
 impl iceberg::transaction::Transaction
 pub async fn iceberg::transaction::Transaction::commit(self, catalog: &dyn iceberg::Catalog) -> iceberg::Result<iceberg::table::Table>
+pub async fn iceberg::transaction::Transaction::commit_once(self, catalog: &dyn iceberg::Catalog) -> iceberg::Result<iceberg::table::Table>
 pub fn iceberg::transaction::Transaction::expire_snapshots(&self) -> iceberg::transaction::expire_snapshots::ExpireSnapshotsAction
 pub fn iceberg::transaction::Transaction::fast_append(&self) -> iceberg::transaction::FastAppendAction
 pub fn iceberg::transaction::Transaction::new(table: &iceberg::table::Table) -> Self
@@ -3460,6 +3533,8 @@ pub trait iceberg::transaction::ApplyTransactionAction
 pub fn iceberg::transaction::ApplyTransactionAction::apply(self, tx: iceberg::transaction::Transaction) -> iceberg::Result<iceberg::transaction::Transaction>
 impl<T: TransactionAction + 'static> iceberg::transaction::ApplyTransactionAction for T
 pub fn T::apply(self, tx: iceberg::transaction::Transaction) -> core::result::Result<iceberg::transaction::Transaction, iceberg::Error>
+pub async fn iceberg::transaction::expired_files_between(file_io: &iceberg::io::FileIO, before: &iceberg::spec::TableMetadata, after: &iceberg::spec::TableMetadata, limits: iceberg::transaction::CleanupTraversalLimits) -> iceberg::Result<iceberg::transaction::ExpiredFileSet>
+pub async fn iceberg::transaction::rewrite_manifests(catalog: &dyn iceberg::Catalog, table: &iceberg::table::Table, selection: iceberg::transaction::ManifestRewriteSelection, limits: iceberg::transaction::ManifestRewriteLimits) -> iceberg::Result<iceberg::transaction::ManifestRewriteResult>
 pub type iceberg::transaction::OverwriteFilesAction = iceberg::transaction::replace_files::ReplaceFilesAction<iceberg::transaction::replace_files::Overwrite>
 pub type iceberg::transaction::RewriteFilesAction = iceberg::transaction::replace_files::ReplaceFilesAction<iceberg::transaction::replace_files::Rewrite>
 pub mod iceberg::transform
@@ -3630,8 +3705,43 @@ pub fn iceberg::writer::file_writer::location_generator::DefaultLocationGenerato
 impl iceberg::writer::file_writer::location_generator::LocationGenerator for iceberg::writer::file_writer::location_generator::ObjectStorageLocationGenerator
 pub fn iceberg::writer::file_writer::location_generator::ObjectStorageLocationGenerator::generate_location(&self, partition_key: core::option::Option<&iceberg::spec::PartitionKey>, file_name: &str) -> alloc::string::String
 pub mod iceberg::writer::file_writer::rolling_writer
+pub enum iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+pub iceberg::writer::file_writer::rolling_writer::RollingCloseReason::Cancel
+pub iceberg::writer::file_writer::rolling_writer::RollingCloseReason::Error
+pub iceberg::writer::file_writer::rolling_writer::RollingCloseReason::Final
+pub iceberg::writer::file_writer::rolling_writer::RollingCloseReason::Threshold
+impl core::clone::Clone for iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+pub fn iceberg::writer::file_writer::rolling_writer::RollingCloseReason::clone(&self) -> iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+impl core::cmp::Eq for iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+impl core::cmp::PartialEq for iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+pub fn iceberg::writer::file_writer::rolling_writer::RollingCloseReason::eq(&self, other: &iceberg::writer::file_writer::rolling_writer::RollingCloseReason) -> bool
+impl core::fmt::Debug for iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+pub fn iceberg::writer::file_writer::rolling_writer::RollingCloseReason::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+impl core::marker::StructuralPartialEq for iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+pub enum iceberg::writer::file_writer::rolling_writer::RollingWriterEvent
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseDecided
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseDecided::logical_ordinal: u64
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseDecided::path: alloc::string::String
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseDecided::reason: iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseDecided::target_file_size: usize
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseDecided::written_size_estimate: usize
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseSettled
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseSettled::completion_ordinal: u64
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseSettled::logical_ordinal: u64
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseSettled::output_files: core::option::Option<usize>
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseSettled::path: alloc::string::String
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::CloseSettled::reason: iceberg::writer::file_writer::rolling_writer::RollingCloseReason
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::OutputOpened
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::OutputOpened::logical_ordinal: u64
+pub iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::OutputOpened::path: alloc::string::String
+impl core::clone::Clone for iceberg::writer::file_writer::rolling_writer::RollingWriterEvent
+pub fn iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::clone(&self) -> iceberg::writer::file_writer::rolling_writer::RollingWriterEvent
+impl core::fmt::Debug for iceberg::writer::file_writer::rolling_writer::RollingWriterEvent
+pub fn iceberg::writer::file_writer::rolling_writer::RollingWriterEvent::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator>
 impl<B, L, F> iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F> where B: iceberg::writer::file_writer::FileWriterBuilder, L: iceberg::writer::file_writer::location_generator::LocationGenerator, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
+pub async fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::cancel(self) -> iceberg::Result<alloc::vec::Vec<iceberg::spec::DataFileBuilder>>
 pub async fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::close(self) -> iceberg::Result<alloc::vec::Vec<iceberg::spec::DataFileBuilder>>
 pub async fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::write(&mut self, partition_key: &core::option::Option<iceberg::spec::PartitionKey>, input: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<()>
 pub async fn iceberg::writer::file_writer::rolling_writer::RollingFileWriter<B, L, F>::write_with_position(&mut self, partition_key: &core::option::Option<iceberg::spec::PartitionKey>, input: &arrow_array::record_batch::RecordBatch) -> iceberg::Result<alloc::vec::Vec<iceberg::writer::base_writer::position_delete_file_writer::PositionDeleteInput>>
@@ -3647,10 +3757,13 @@ pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B,
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>::new(inner_builder: B, target_file_size: usize, file_io: iceberg::io::FileIO, location_generator: L, file_name_generator: F) -> Self
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>::new_with_default_file_size(inner_builder: B, file_io: iceberg::io::FileIO, location_generator: L, file_name_generator: F) -> Self
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>::with_max_concurrent_closes(self, max_concurrent_closes: usize) -> Self
+pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>::with_observer(self, observer: alloc::sync::Arc<dyn iceberg::writer::file_writer::rolling_writer::RollingWriterObserver>) -> Self
 impl<B: core::clone::Clone + iceberg::writer::file_writer::FileWriterBuilder, L: core::clone::Clone + iceberg::writer::file_writer::location_generator::LocationGenerator, F: core::clone::Clone + iceberg::writer::file_writer::location_generator::FileNameGenerator> core::clone::Clone for iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>::clone(&self) -> iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>
 impl<B: core::fmt::Debug + iceberg::writer::file_writer::FileWriterBuilder, L: core::fmt::Debug + iceberg::writer::file_writer::location_generator::LocationGenerator, F: core::fmt::Debug + iceberg::writer::file_writer::location_generator::FileNameGenerator> core::fmt::Debug for iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>
 pub fn iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder<B, L, F>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub trait iceberg::writer::file_writer::rolling_writer::RollingWriterObserver: core::fmt::Debug + core::marker::Send + core::marker::Sync
+pub fn iceberg::writer::file_writer::rolling_writer::RollingWriterObserver::on_event(&self, event: iceberg::writer::file_writer::rolling_writer::RollingWriterEvent)
 pub struct iceberg::writer::file_writer::ParquetWriter
 impl iceberg::writer::CurrentFileStatus for iceberg::writer::file_writer::ParquetWriter
 pub fn iceberg::writer::file_writer::ParquetWriter::current_file_path(&self) -> alloc::string::String
