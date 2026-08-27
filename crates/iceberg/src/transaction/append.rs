@@ -221,7 +221,7 @@ impl SnapshotProduceOperation for FastAppendOperation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
@@ -256,7 +256,7 @@ mod tests {
     ///
     /// Returns the table plus the `manifest_path` of the delete-only manifest so callers
     /// can assert whether a subsequent append carries it forward.
-    async fn make_table_with_delete_only_manifest() -> (Table, TempDir, String) {
+    pub(crate) async fn make_table_with_delete_only_manifest() -> (Table, TempDir, String) {
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path().join("table1");
         let manifest_list_location = table_location.join("metadata/manifests_list_1.avro");
