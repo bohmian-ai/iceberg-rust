@@ -75,7 +75,10 @@ filterwarnings = [
 dev = [
   "maturin>=1.9.4,<2.0",
   "pytest>=8.3.2",
-  "datafusion>=52,<55",
+  # datafusion-python has not published a 55.x wheel yet. Keep the latest
+  # available wheel for the rest of the binding suite; the FFI provider test
+  # is explicitly gated until a 55.x wheel is available.
+  "datafusion==54.*",
   # Set a PyIceberg lower bound; otherwise the resolver may select the
   # unrelated 0.0.2 stub.
   # Keep pyarrow direct because current pyiceberg[pyarrow] releases depend on
