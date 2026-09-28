@@ -354,6 +354,42 @@ impl SqlCatalog {
         })
     }
 
+    /// Reads only the table's current metadata pointer from the catalog row.
+    ///
+    /// Every commit writes a new metadata file at a fresh
+    /// `<version>-<uuid>.metadata.json` location and swaps this pointer, so an
+    /// unchanged pointer names an unchanged metadata document. Callers that
+    /// already hold that document can recheck the pointer without re-reading
+    /// it. Returns `None` when the table does not exist.
+    pub async fn load_metadata_location(&self, identifier: &TableIdent) -> Result<Option<String>> {
+        let rows = self
+            .fetch_rows(
+                &format!(
+                    "SELECT {CATALOG_FIELD_METADATA_LOCATION_PROP}
+                     FROM {CATALOG_TABLE_NAME}
+                     WHERE {CATALOG_FIELD_CATALOG_NAME} = ?
+                      AND {CATALOG_FIELD_TABLE_NAME} = ?
+                      AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
+                      AND (
+                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
+                        OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
+                      )"
+                ),
+                vec![
+                    Some(&self.name),
+                    Some(identifier.name()),
+                    Some(&identifier.namespace().join(".")),
+                ],
+            )
+            .await?;
+        rows.first()
+            .map(|row| {
+                row.try_get::<String, _>(CATALOG_FIELD_METADATA_LOCATION_PROP)
+                    .map_err(from_sqlx_error)
+            })
+            .transpose()
+    }
+
     /// SQLX Any does not implement PostgresSQL bindings, so we have to do this.
     fn replace_placeholders(&self, query: &str) -> String {
         match self.sql_bind_style {
@@ -435,10 +471,10 @@ impl Catalog for SqlCatalog {
         );
 
         let namespace_rows = self
-            .fetch_rows(&all_namespaces_stmt, vec![
-                Some(&self.name),
-                Some(&self.name),
-            ])
+            .fetch_rows(
+                &all_namespaces_stmt,
+                vec![Some(&self.name), Some(&self.name)],
+            )
             .await?;
 
         let mut namespaces = HashSet::<NamespaceIdent>::with_capacity(namespace_rows.len());
@@ -816,35 +852,9 @@ impl Catalog for SqlCatalog {
             return no_such_table_err(identifier);
         }
 
-        let rows = self
-            .fetch_rows(
-                &format!(
-                    "SELECT {CATALOG_FIELD_METADATA_LOCATION_PROP}
-                     FROM {CATALOG_TABLE_NAME}
-                     WHERE {CATALOG_FIELD_CATALOG_NAME} = ?
-                      AND {CATALOG_FIELD_TABLE_NAME} = ?
-                      AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
-                      AND (
-                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
-                        OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
-                      )"
-                ),
-                vec![
-                    Some(&self.name),
-                    Some(identifier.name()),
-                    Some(&identifier.namespace().join(".")),
-                ],
-            )
-            .await?;
-
-        if rows.is_empty() {
+        let Some(tbl_metadata_location) = self.load_metadata_location(identifier).await? else {
             return no_such_table_err(identifier);
-        }
-
-        let row = &rows[0];
-        let tbl_metadata_location = row
-            .try_get::<String, _>(CATALOG_FIELD_METADATA_LOCATION_PROP)
-            .map_err(from_sqlx_error)?;
+        };
 
         let metadata = TableMetadata::read_from(&self.fileio, &tbl_metadata_location).await?;
 
@@ -1079,7 +1089,7 @@ mod tests {
         NAMESPACE_LOCATION_PROPERTY_KEY, SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI,
         SQL_CATALOG_PROP_WAREHOUSE,
     };
-    use crate::{SqlBindStyle, SqlCatalogBuilder};
+    use crate::{SqlBindStyle, SqlCatalog, SqlCatalogBuilder};
 
     const UUID_REGEX_STR: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
@@ -1100,7 +1110,7 @@ mod tests {
     async fn new_sql_catalog(
         warehouse_location: String,
         name: Option<impl ToString>,
-    ) -> impl Catalog {
+    ) -> SqlCatalog {
         let name = if let Some(name) = name {
             name.to_string()
         } else {
@@ -1502,11 +1512,10 @@ mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -1539,11 +1548,10 @@ mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("c".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -1569,13 +1577,16 @@ mod tests {
         let namespace_ident_3 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_4 = NamespaceIdent::from_strs(vec!["a", "c"]).unwrap();
         let namespace_ident_5 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-            &namespace_ident_4,
-            &namespace_ident_5,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_1,
+                &namespace_ident_2,
+                &namespace_ident_3,
+                &namespace_ident_4,
+                &namespace_ident_5,
+            ],
+        )
         .await;
 
         assert_eq!(
@@ -1788,11 +1799,14 @@ mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         catalog
@@ -2074,9 +2088,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            table_ident
-        ],);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![table_ident],
+        );
     }
 
     #[tokio::test]
@@ -2086,11 +2101,14 @@ mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         let src_table_ident = TableIdent::new(namespace_ident_a_b_c.clone(), "tbl1".into());
@@ -2126,6 +2144,50 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             format!("NamespaceNotFound => No such namespace: {non_existent_dst_namespace_ident:?}"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_metadata_location_tracks_each_commit() {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+        let warehouse_loc = temp_path();
+        let catalog = new_sql_catalog(warehouse_loc, Some("iceberg")).await;
+        let namespace_ident = NamespaceIdent::new("n1".into());
+        let table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
+        let missing_ident = TableIdent::new(namespace_ident.clone(), "missing".into());
+        create_namespace(&catalog, &namespace_ident).await;
+        create_table(&catalog, &table_ident).await;
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        let created = catalog
+            .load_metadata_location(&table_ident)
+            .await
+            .unwrap()
+            .expect("created table has a pointer");
+        assert_eq!(table.metadata_location(), Some(created.as_str()));
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("k".to_string(), "v".to_string())
+            .apply(tx)
+            .unwrap();
+        let committed = tx.commit(&catalog).await.unwrap();
+        let updated = catalog
+            .load_metadata_location(&table_ident)
+            .await
+            .unwrap()
+            .expect("committed table has a pointer");
+        assert_ne!(updated, created, "a commit writes a new metadata location");
+        assert_eq!(committed.metadata_location(), Some(updated.as_str()));
+
+        assert_eq!(
+            catalog
+                .load_metadata_location(&missing_ident)
+                .await
+                .unwrap(),
+            None
         );
     }
 }
