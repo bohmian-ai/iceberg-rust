@@ -17,7 +17,13 @@
 
 //! Parquet file data reader
 
+use std::sync::Arc;
+
+use futures::future::BoxFuture;
+use parquet::file::metadata::ParquetMetaData;
+
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::error::Result;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
 use crate::util::available_parallelism;
@@ -50,6 +56,22 @@ use projection::{
     find_leaf_by_field_id,
 };
 
+/// Supplies decoded Parquet metadata for data files in place of the reader's
+/// own footer decode.
+///
+/// An embedder installs one with [`ArrowReaderBuilder::with_parquet_metadata_loader`]
+/// to share footers across scans, typically through a cache it governs. The
+/// loader is consulted only for unencrypted data files; encrypted files keep the
+/// reader's own decode because their footers need the task's decryption keys.
+pub trait ParquetMetadataLoader: Send + Sync {
+    /// Returns the metadata of the immutable Parquet object at `path`, whose
+    /// manifest-recorded size is `size` bytes.
+    ///
+    /// The returned metadata should carry the page index when the file has
+    /// one; the reader uses it for row selection and positional deletes.
+    fn load(&self, path: &str, size: u64) -> BoxFuture<'static, Result<Arc<ParquetMetaData>>>;
+}
+
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
@@ -59,6 +81,7 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
+    metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
 }
 
 impl ArrowReaderBuilder {
@@ -74,7 +97,15 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
+            metadata_loader: None,
         }
+    }
+
+    /// Loads unencrypted data-file metadata through `loader` instead of decoding
+    /// each footer in the reader.
+    pub fn with_parquet_metadata_loader(mut self, loader: Arc<dyn ParquetMetadataLoader>) -> Self {
+        self.metadata_loader = Some(loader);
+        self
     }
 
     /// Sets the max number of in flight data files that are being fetched
@@ -142,6 +173,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
+            metadata_loader: self.metadata_loader,
         }
     }
 }
@@ -159,4 +191,5 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
 }

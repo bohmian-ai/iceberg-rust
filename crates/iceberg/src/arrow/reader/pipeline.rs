@@ -34,8 +34,9 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
-    apply_name_mapping_to_arrow_schema, find_leaf_by_field_id,
+    ArrowFileReader, ArrowReader, ParquetMetadataLoader, ParquetReadOptions,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -72,6 +73,7 @@ impl ArrowReader {
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
+            metadata_loader: self.metadata_loader,
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -125,6 +127,7 @@ struct FileScanTaskReader {
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
+    metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
 }
 
 impl FileScanTaskReader {
@@ -139,15 +142,31 @@ impl FileScanTaskReader {
             .load_deletes(&task.deletes, Arc::clone(&task.schema));
 
         // Open the Parquet file once, loading its metadata
-        let (parquet_file_reader, arrow_metadata) = ArrowReader::open_parquet_file(
-            &task.data_file_path,
-            &self.file_io,
-            task.file_size_in_bytes,
-            parquet_read_options,
-            self.scan_metrics.bytes_read_counter(),
-            task.key_metadata.as_deref(),
-        )
-        .await?;
+        let (parquet_file_reader, arrow_metadata) =
+            match (&self.metadata_loader, task.key_metadata.as_deref()) {
+                (Some(loader), None) => {
+                    ArrowReader::open_parquet_file_with_loader(
+                        &task.data_file_path,
+                        &self.file_io,
+                        task.file_size_in_bytes,
+                        parquet_read_options,
+                        self.scan_metrics.bytes_read_counter(),
+                        loader.as_ref(),
+                    )
+                    .await?
+                }
+                (_, key_metadata) => {
+                    ArrowReader::open_parquet_file(
+                        &task.data_file_path,
+                        &self.file_io,
+                        task.file_size_in_bytes,
+                        parquet_read_options,
+                        self.scan_metrics.bytes_read_counter(),
+                        key_metadata,
+                    )
+                    .await?
+                }
+            };
 
         // Check if Parquet file has embedded field IDs
         // Corresponds to Java's ParquetSchemaUtil.hasIds()
@@ -716,6 +735,42 @@ impl ArrowReader {
         .await
     }
 
+    /// Opens an unencrypted Parquet file whose metadata comes from `loader`.
+    ///
+    /// The loader runs first, so a failed load opens nothing; the returned
+    /// reader is wrapped in [`CountingFileRead`] exactly like
+    /// [`Self::open_parquet_file`], so data-page IO is still counted.
+    pub(crate) async fn open_parquet_file_with_loader(
+        data_file_path: &str,
+        file_io: &FileIO,
+        file_size_in_bytes: u64,
+        parquet_read_options: ParquetReadOptions,
+        bytes_read: &Arc<AtomicU64>,
+        loader: &dyn ParquetMetadataLoader,
+    ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
+        let metadata = loader.load(data_file_path, file_size_in_bytes).await?;
+        let arrow_metadata = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::default())
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Loaded Parquet metadata is unusable",
+                )
+                .with_context("path", data_file_path.to_string())
+                .with_source(e)
+            })?;
+        let parquet_file = file_io.new_input(data_file_path)?;
+        let counting_reader =
+            CountingFileRead::new(parquet_file.reader().await?, Arc::clone(bytes_read));
+        let reader = ArrowFileReader::new(
+            FileMetadata {
+                size: file_size_in_bytes,
+            },
+            Box::new(counting_reader),
+        )
+        .with_parquet_read_options(parquet_read_options);
+        Ok((reader, arrow_metadata))
+    }
+
     async fn build_parquet_reader(
         parquet_reader: Box<dyn FileRead>,
         file_size_in_bytes: u64,
@@ -838,6 +893,84 @@ mod tests {
         let expected_micros = (INT96_TEST_JULIAN_DAY as i64 - UNIX_EPOCH_JULIAN) * MICROS_PER_DAY
             + (INT96_TEST_NANOS_WITHIN_DAY / 1_000) as i64;
         (val, expected_micros)
+    }
+
+    /// Counts footer loads and decodes each one from the local file.
+    struct CountingLoader(std::sync::atomic::AtomicUsize);
+
+    impl crate::arrow::ParquetMetadataLoader for CountingLoader {
+        fn load(
+            &self,
+            path: &str,
+            _size: u64,
+        ) -> futures::future::BoxFuture<
+            'static,
+            crate::Result<Arc<parquet::file::metadata::ParquetMetaData>>,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let file = File::open(path).unwrap();
+            let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional)
+                .parse_and_finish(&file)
+                .unwrap();
+            Box::pin(futures::future::ready(Ok(Arc::new(metadata))))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metadata_loader_supplies_data_file_footers() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("loaded.parquet");
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![Arc::new(
+            Int32Array::from(vec![1, 2, 3]),
+        )])
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let loader = Arc::new(CountingLoader(std::sync::atomic::AtomicUsize::new(0)));
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_parquet_metadata_loader(Arc::clone(&loader) as _)
+            .build();
+        let tasks = Box::pin(futures::stream::iter([Ok(FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(path.to_str().unwrap().to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1])
+            .with_case_sensitive(false)
+            .build())])) as FileScanTaskStream;
+
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        assert_eq!(loader.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let ids = batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(ids.values(), &[1, 2, 3]);
     }
 
     #[tokio::test]
