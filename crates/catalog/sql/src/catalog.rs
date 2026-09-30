@@ -30,7 +30,7 @@ use iceberg::{
     Runtime, TableCommit, TableCreation, TableIdent,
 };
 use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow, install_default_drivers};
-use sqlx::{Any, AnyPool, Row, Transaction};
+use sqlx::{Any, AnyPool, Connection as _, Row, Transaction};
 
 use crate::error::{
     from_sqlx_error, no_such_namespace_err, no_such_table_err, table_already_exists_err,
@@ -309,10 +309,33 @@ impl SqlCatalog {
             TEST_BEFORE_ACQUIRE,
         )?;
 
-        let pool = AnyPoolOptions::new()
+        let test_idle_after = config
+            .props
+            .contains_key("pool.test-idle-after-ms")
+            .then(|| parse_pool_property(&config.props, "pool.test-idle-after-ms", 0_u64))
+            .transpose()?
+            .map(Duration::from_millis);
+
+        let options = AnyPoolOptions::new()
             .max_connections(max_connections)
-            .idle_timeout(Duration::from_secs(idle_timeout))
-            .test_before_acquire(test_before_acquire)
+            .idle_timeout(Duration::from_secs(idle_timeout));
+        // A connection used moments ago is overwhelmingly still alive, so an
+        // idle threshold pings only connections that sat long enough to have
+        // been dropped, instead of paying a round trip on every checkout.
+        let options = match test_idle_after {
+            Some(threshold) if test_before_acquire => options
+                .test_before_acquire(false)
+                .before_acquire(move |conn, meta| {
+                    Box::pin(async move {
+                        if meta.idle_for > threshold {
+                            conn.ping().await?;
+                        }
+                        Ok(true)
+                    })
+                }),
+            _ => options.test_before_acquire(test_before_acquire),
+        };
+        let pool = options
             .connect(&config.uri)
             .await
             .map_err(from_sqlx_error)?;
@@ -1462,11 +1485,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_idle_gated_pool_serves_reused_connections() {
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+        // One connection and a zero threshold force every reuse through the
+        // idle-gated ping.
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "iceberg",
+                HashMap::from_iter([
+                    (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+                    (SQL_CATALOG_PROP_WAREHOUSE.to_string(), temp_path()),
+                    ("pool.max-connections".to_string(), "1".to_string()),
+                    ("pool.test-idle-after-ms".to_string(), "0".to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![]);
+        }
+    }
+
+    #[tokio::test]
     async fn test_builder_props_invalid_pool_property_fails() {
         for property in [
             "pool.max-connections",
             "pool.idle-timeout",
             "pool.test-before-acquire",
+            "pool.test-idle-after-ms",
         ] {
             let error = SqlCatalogBuilder::default()
                 .with_storage_factory(Arc::new(LocalFsStorageFactory))
