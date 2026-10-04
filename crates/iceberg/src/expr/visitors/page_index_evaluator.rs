@@ -28,6 +28,7 @@ use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
+use crate::spec::decimal_utils::i128_from_be_bytes;
 use crate::spec::{Datum, PrimitiveLiteral, PrimitiveType, Schema};
 use crate::{Error, ErrorKind, Result};
 
@@ -55,6 +56,105 @@ impl PageNullCount {
             (_, Some(_)) => PageNullCount::SomeNull,
             _ => PageNullCount::Unknown,
         }
+    }
+}
+
+/// One page's physical min or max value as stored in a Parquet column index.
+///
+/// Bounds are carried in their physical form so that a single place,
+/// [`PageBound::to_datum`], decides how each physical type is read under an
+/// Iceberg type.
+#[derive(Clone, Copy)]
+enum PageBound<'b> {
+    /// `BOOLEAN` bound.
+    Boolean(bool),
+    /// `INT32` bound.
+    Int32(i32),
+    /// `INT64` bound.
+    Int64(i64),
+    /// `FLOAT` bound.
+    Float(f32),
+    /// `DOUBLE` bound.
+    Double(f64),
+    /// `BYTE_ARRAY` bound; writers may truncate it and it need not be UTF-8.
+    ByteArray(&'b [u8]),
+    /// `FIXED_LEN_BYTE_ARRAY` bound; writers may truncate it.
+    FixedLenByteArray(&'b [u8]),
+}
+
+impl PageBound<'_> {
+    /// Interprets an optional page bound under `field_type`.
+    ///
+    /// Returns `None` when the physical/Iceberg pairing is unsupported, so
+    /// the caller keeps every page of the column. Returns `Some(None)` when
+    /// the page has no bound (all-null page) or the bound is malformed for
+    /// the type, which predicates treat as "might match".
+    fn option_to_datum(bound: Option<Self>, field_type: &PrimitiveType) -> Option<Option<Datum>> {
+        match bound {
+            None => Some(None),
+            Some(bound) => bound.to_datum(field_type),
+        }
+    }
+
+    /// Interprets this physical bound as an Iceberg [`Datum`] of `field_type`.
+    ///
+    /// Byte bounds keep their unsigned byte order: `binary` and `fixed`
+    /// compare as raw bytes (never decoded as UTF-8), `uuid` requires exactly
+    /// 16 bytes, `string` requires valid UTF-8, and `decimal` decodes the
+    /// untruncated big-endian two's-complement `FIXED_LEN_BYTE_ARRAY`.
+    /// Integer-backed decimals widen to the decimal's unscaled value, and
+    /// `INT32`/`FLOAT` widen to `long`/`double` for promoted columns.
+    ///
+    /// Returns `None` for an unsupported pairing and `Some(None)` for a
+    /// bound that is malformed for an otherwise supported pairing.
+    fn to_datum(self, field_type: &PrimitiveType) -> Option<Option<Datum>> {
+        let literal = match (field_type, self) {
+            (PrimitiveType::Boolean, Self::Boolean(v)) => PrimitiveLiteral::Boolean(v),
+            (PrimitiveType::Int | PrimitiveType::Date, Self::Int32(v)) => PrimitiveLiteral::Int(v),
+            (PrimitiveType::Long, Self::Int32(v)) => PrimitiveLiteral::Long(i64::from(v)),
+            (
+                PrimitiveType::Long
+                | PrimitiveType::Time
+                | PrimitiveType::Timestamp
+                | PrimitiveType::Timestamptz
+                | PrimitiveType::TimestampNs
+                | PrimitiveType::TimestamptzNs,
+                Self::Int64(v),
+            ) => PrimitiveLiteral::Long(v),
+            (PrimitiveType::Decimal { .. }, Self::Int32(v)) => {
+                PrimitiveLiteral::Int128(i128::from(v))
+            }
+            (PrimitiveType::Decimal { .. }, Self::Int64(v)) => {
+                PrimitiveLiteral::Int128(i128::from(v))
+            }
+            (PrimitiveType::Float, Self::Float(v)) => PrimitiveLiteral::Float(OrderedFloat(v)),
+            (PrimitiveType::Double, Self::Float(v)) => {
+                PrimitiveLiteral::Double(OrderedFloat(f64::from(v)))
+            }
+            (PrimitiveType::Double, Self::Double(v)) => PrimitiveLiteral::Double(OrderedFloat(v)),
+            (PrimitiveType::String, Self::ByteArray(bytes)) => match std::str::from_utf8(bytes) {
+                Ok(value) => PrimitiveLiteral::String(value.to_owned()),
+                Err(_) => return Some(None),
+            },
+            (PrimitiveType::Binary, Self::ByteArray(bytes))
+            | (PrimitiveType::Fixed(_), Self::FixedLenByteArray(bytes)) => {
+                PrimitiveLiteral::Binary(bytes.to_vec())
+            }
+            (PrimitiveType::Uuid, Self::FixedLenByteArray(bytes)) => {
+                match <[u8; 16]>::try_from(bytes) {
+                    Ok(bytes) => PrimitiveLiteral::UInt128(u128::from_be_bytes(bytes)),
+                    Err(_) => return Some(None),
+                }
+            }
+            (PrimitiveType::Decimal { .. }, Self::FixedLenByteArray(bytes)) => {
+                match i128_from_be_bytes(bytes) {
+                    Some(value) => PrimitiveLiteral::Int128(value),
+                    None => return Some(None),
+                }
+            }
+            _ => return None,
+        };
+        Some(Some(Datum::new(field_type.clone(), literal)))
     }
 }
 
@@ -237,6 +337,20 @@ impl<'a> PageIndexEvaluator<'a> {
         row_counts
     }
 
+    /// Evaluates `predicate` against every page of one column index and
+    /// returns the per-page keep decision.
+    ///
+    /// Each page's physical min/max is first read as a [`PageBound`] and then
+    /// interpreted under the Iceberg `field_type` by [`PageBound::to_datum`].
+    /// Returns `Ok(None)` — keep every page — when the column carries no
+    /// index (`NONE`), uses a physical type with no comparable bound
+    /// (`INT96`), or pairs a physical type with an Iceberg type that has no
+    /// defined reading. Malformed individual bounds become unknown bounds,
+    /// which predicates treat as "might match".
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error returned by `predicate`.
     fn apply_predicate_to_column_index<F>(
         predicate: F,
         field_type: &PrimitiveType,
@@ -246,137 +360,76 @@ impl<'a> PageIndexEvaluator<'a> {
     where
         F: Fn(Option<Datum>, Option<Datum>, PageNullCount) -> Result<bool>,
     {
-        let result: Result<Vec<bool>> = match column_index {
-            ColumnIndexMetaData::NONE => {
-                return Ok(None);
+        fn pages<'b, T: 'b>(
+            mins: impl Iterator<Item = Option<&'b T>>,
+            maxs: impl Iterator<Item = Option<&'b T>>,
+            to_bound: impl Fn(&'b T) -> PageBound<'b>,
+        ) -> Vec<(Option<PageBound<'b>>, Option<PageBound<'b>>)> {
+            mins.zip(maxs)
+                .map(|(min, max)| (min.map(&to_bound), max.map(&to_bound)))
+                .collect()
+        }
+
+        let bounds = match column_index {
+            ColumnIndexMetaData::NONE | ColumnIndexMetaData::INT96(_) => return Ok(None),
+            ColumnIndexMetaData::BOOLEAN(idx) => {
+                pages(idx.min_values_iter(), idx.max_values_iter(), |&v| {
+                    PageBound::Boolean(v)
+                })
             }
-            ColumnIndexMetaData::BOOLEAN(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::new(field_type.clone(), PrimitiveLiteral::Boolean(val))
-                        }),
-                        max.map(|&val| {
-                            Datum::new(field_type.clone(), PrimitiveLiteral::Boolean(val))
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
+            ColumnIndexMetaData::INT32(idx) => {
+                pages(idx.min_values_iter(), idx.max_values_iter(), |&v| {
+                    PageBound::Int32(v)
                 })
-                .collect(),
-            ColumnIndexMetaData::INT32(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| Datum::new(field_type.clone(), PrimitiveLiteral::Int(val))),
-                        max.map(|&val| Datum::new(field_type.clone(), PrimitiveLiteral::Int(val))),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
+            }
+            ColumnIndexMetaData::INT64(idx) => {
+                pages(idx.min_values_iter(), idx.max_values_iter(), |&v| {
+                    PageBound::Int64(v)
                 })
-                .collect(),
-            ColumnIndexMetaData::INT64(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| Datum::new(field_type.clone(), PrimitiveLiteral::Long(val))),
-                        max.map(|&val| Datum::new(field_type.clone(), PrimitiveLiteral::Long(val))),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
+            }
+            ColumnIndexMetaData::FLOAT(idx) => {
+                pages(idx.min_values_iter(), idx.max_values_iter(), |&v| {
+                    PageBound::Float(v)
                 })
-                .collect(),
-            ColumnIndexMetaData::FLOAT(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Float(OrderedFloat::from(val)),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
+            }
+            ColumnIndexMetaData::DOUBLE(idx) => {
+                pages(idx.min_values_iter(), idx.max_values_iter(), |&v| {
+                    PageBound::Double(v)
                 })
-                .collect(),
-            ColumnIndexMetaData::DOUBLE(idx) => idx
-                .min_values_iter()
-                .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Double(OrderedFloat::from(val)),
-                            )
-                        }),
-                        max.map(|&val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::Double(OrderedFloat::from(val)),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
-                    )
-                })
-                .collect(),
+            }
             ColumnIndexMetaData::BYTE_ARRAY(idx) => idx
                 .min_values_iter()
                 .zip(idx.max_values_iter())
-                .enumerate()
-                .zip(row_counts.iter())
-                .map(|((i, (min, max)), &row_count)| {
-                    predicate(
-                        min.map(|val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::String(String::from_utf8(val.to_vec()).unwrap()),
-                            )
-                        }),
-                        max.map(|val| {
-                            Datum::new(
-                                field_type.clone(),
-                                PrimitiveLiteral::String(String::from_utf8(val.to_vec()).unwrap()),
-                            )
-                        }),
-                        PageNullCount::from_row_and_null_counts(row_count, idx.null_count(i)),
+                .map(|(min, max)| (min.map(PageBound::ByteArray), max.map(PageBound::ByteArray)))
+                .collect(),
+            ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx) => idx
+                .min_values_iter()
+                .zip(idx.max_values_iter())
+                .map(|(min, max)| {
+                    (
+                        min.map(PageBound::FixedLenByteArray),
+                        max.map(PageBound::FixedLenByteArray),
                     )
                 })
                 .collect(),
-            ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_) => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "unsupported 'FIXED_LEN_BYTE_ARRAY' index type in column_index",
-                ));
-            }
-            ColumnIndexMetaData::INT96(_) => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    "unsupported 'INT96' index type in column_index",
-                ));
-            }
         };
 
-        Ok(Some(result?))
+        let mut selected = Vec::with_capacity(bounds.len());
+        for (i, ((min, max), &row_count)) in bounds.into_iter().zip(row_counts).enumerate() {
+            let (Some(min), Some(max)) = (
+                PageBound::option_to_datum(min, field_type),
+                PageBound::option_to_datum(max, field_type),
+            ) else {
+                return Ok(None);
+            };
+            selected.push(predicate(
+                min,
+                max,
+                PageNullCount::from_row_and_null_counts(row_count, column_index.null_count(i)),
+            )?);
+        }
+
+        Ok(Some(selected))
     }
 
     fn visit_inequality(
@@ -779,13 +832,17 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_array::{
+        ArrayRef, BinaryArray, FixedSizeBinaryArray, Float32Array, RecordBatch, StringArray,
+        TimestampMicrosecondArray,
+    };
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::{
         ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelector,
     };
     use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
+    use parquet::file::page_index::column_index::ColumnIndexMetaData;
     use parquet::file::properties::WriterProperties;
     use rand::Rng;
     use tempfile::NamedTempFile;
@@ -900,7 +957,7 @@ mod tests {
     fn get_test_metadata(
         metadata: &ParquetMetaData,
     ) -> (
-        Vec<parquet::file::page_index::column_index::ColumnIndexMetaData>,
+        Vec<ColumnIndexMetaData>,
         Vec<parquet::file::page_index::offset_index::OffsetIndexMetaData>,
         &parquet::file::metadata::RowGroupMetaData,
     ) {
@@ -1334,6 +1391,186 @@ mod tests {
         ];
 
         assert_eq!(result, expected);
+
+        Ok(())
+    }
+
+    /// Rows written per data page by [`create_binary_bounds_parquet_file`].
+    const BINARY_PAGE_ROWS: usize = 1024;
+
+    /// Number of data pages written by [`create_binary_bounds_parquet_file`].
+    const BINARY_PAGES: usize = 4;
+
+    /// Returns the 16-byte identifier written at `row` of `page`.
+    ///
+    /// The first byte is the page number, so identifiers sort by page and
+    /// every page's `FIXED_LEN_BYTE_ARRAY` bounds are disjoint.
+    fn binary_bounds_id(page: usize, row: usize) -> Vec<u8> {
+        let mut id = vec![0u8; 16];
+        id[0] = page as u8;
+        id[14..].copy_from_slice(&(row as u16).to_be_bytes());
+        id
+    }
+
+    /// Returns the non-UTF-8 binary payload written on every row of `page`.
+    fn binary_bounds_payload(page: usize) -> Vec<u8> {
+        vec![0xFF, 0xFE, page as u8]
+    }
+
+    /// Writes one row group of [`BINARY_PAGES`] data pages holding a 16-byte
+    /// fixed-size id, a non-UTF-8 binary payload, and a microsecond
+    /// timestamp equal to `page * 1_000_000 + row`, and returns its metadata
+    /// with the page index loaded.
+    fn create_binary_bounds_parquet_file() -> Result<(Arc<ParquetMetaData>, NamedTempFile)> {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::FixedSizeBinary(16), false),
+            Field::new("payload", DataType::Binary, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(BINARY_PAGE_ROWS)
+            .set_write_batch_size(512)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            temp_file.reopen().unwrap(),
+            arrow_schema.clone(),
+            Some(props),
+        )
+        .unwrap();
+
+        for page in 0..BINARY_PAGES {
+            let ids: Vec<Vec<u8>> = (0..BINARY_PAGE_ROWS)
+                .map(|row| binary_bounds_id(page, row))
+                .collect();
+            let payloads = vec![binary_bounds_payload(page); BINARY_PAGE_ROWS];
+            let timestamps: Vec<i64> = (0..BINARY_PAGE_ROWS)
+                .map(|row| (page * 1_000_000 + row) as i64)
+                .collect();
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(FixedSizeBinaryArray::try_from_iter(ids.into_iter()).unwrap()),
+                Arc::new(BinaryArray::from_iter_values(payloads)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            ])
+            .unwrap();
+            // Write rows one at a time so the writer honours the page row limit.
+            for row in 0..batch.num_rows() {
+                writer.write(&batch.slice(row, 1)).unwrap();
+            }
+        }
+        writer.close().unwrap();
+
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            temp_file.reopen().unwrap(),
+            options,
+        )
+        .unwrap();
+        Ok((reader.metadata().clone(), temp_file))
+    }
+
+    /// Proves that binary page bounds keep real page selection: 16-byte
+    /// fixed-size ids select only the page holding the value, non-UTF-8
+    /// binary bounds are compared as bytes, a binary `IN` intersected with a
+    /// selective timestamp bound narrows to the single matching page, and an
+    /// Iceberg type with no defined reading of the physical bound keeps every
+    /// page instead of failing.
+    #[test]
+    fn binary_bounds_preserve_mixed_pruning() -> Result<()> {
+        let (metadata, _temp_file) = create_binary_bounds_parquet_file()?;
+        let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
+        assert!(
+            matches!(
+                column_index[0],
+                ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(_)
+            ),
+            "id must carry a FIXED_LEN_BYTE_ARRAY column index"
+        );
+        assert_eq!(column_index[0].num_pages(), BINARY_PAGES as u64);
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields([
+                    Arc::new(NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Fixed(16)),
+                    )),
+                    Arc::new(NestedField::required(
+                        2,
+                        "payload",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                    Arc::new(NestedField::required(
+                        3,
+                        "ts",
+                        Type::Primitive(PrimitiveType::Timestamp),
+                    )),
+                    Arc::new(NestedField::required(
+                        4,
+                        "id_as_int",
+                        Type::Primitive(PrimitiveType::Int),
+                    )),
+                ])
+                .build()?,
+        );
+        let field_id_map = HashMap::from_iter([(1, 0), (2, 1), (3, 2), (4, 0)]);
+        let page = |selectors: &[(bool, usize)]| -> Vec<RowSelector> {
+            selectors
+                .iter()
+                .map(|&(select, pages)| {
+                    let rows = pages * BINARY_PAGE_ROWS;
+                    if select {
+                        RowSelector::select(rows)
+                    } else {
+                        RowSelector::skip(rows)
+                    }
+                })
+                .collect()
+        };
+        let eval = |filter: crate::expr::Predicate| -> Result<Vec<RowSelector>> {
+            let bound = filter.bind(schema.clone(), false)?;
+            PageIndexEvaluator::eval(
+                &bound,
+                &column_index,
+                &offset_index,
+                row_group_metadata,
+                &field_id_map,
+                schema.as_ref(),
+            )
+        };
+
+        let fixed_eq = eval(Reference::new("id").equal_to(Datum::fixed(binary_bounds_id(2, 5))))?;
+        assert_eq!(fixed_eq, page(&[(false, 2), (true, 1), (false, 1)]));
+
+        let fixed_absent =
+            eval(Reference::new("id").equal_to(Datum::fixed(binary_bounds_id(9, 0))))?;
+        assert_eq!(fixed_absent, page(&[(false, 4)]));
+
+        let binary_eq =
+            eval(Reference::new("payload").equal_to(Datum::binary(binary_bounds_payload(1))))?;
+        assert_eq!(binary_eq, page(&[(false, 1), (true, 1), (false, 2)]));
+
+        let mixed = eval(
+            Reference::new("id")
+                .is_in([
+                    Datum::fixed(binary_bounds_id(0, 7)),
+                    Datum::fixed(binary_bounds_id(2, 7)),
+                ])
+                .and(
+                    Reference::new("ts")
+                        .greater_than_or_equal_to(Datum::timestamp_micros(2_000_000)),
+                ),
+        )?;
+        assert_eq!(mixed, page(&[(false, 2), (true, 1), (false, 1)]));
+
+        let unsupported = eval(Reference::new("id_as_int").equal_to(Datum::int(5)))?;
+        assert_eq!(unsupported, page(&[(true, 4)]));
 
         Ok(())
     }
