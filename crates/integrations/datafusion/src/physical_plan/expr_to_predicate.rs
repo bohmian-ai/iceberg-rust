@@ -423,6 +423,9 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::LargeUtf8(Some(v)) => Some(Datum::string(v.clone())),
         ScalarValue::Binary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
+        // DataFusion unwraps a cast over a fixed-size binary column into a
+        // fixed-size literal; its bytes carry the same width as the column.
+        ScalarValue::FixedSizeBinary(_, Some(v)) => Some(Datum::fixed(v.iter().copied())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
         // Timestamp conversions
@@ -701,6 +704,33 @@ mod tests {
 
         let datum = super::scalar_value_to_datum(&ScalarValue::Binary(None));
         assert_eq!(datum, None);
+    }
+
+    #[test]
+    fn test_scalar_value_to_datum_fixed_size_binary() {
+        use datafusion::common::ScalarValue;
+
+        let bytes = vec![0xffu8; 16];
+        let datum =
+            super::scalar_value_to_datum(&ScalarValue::FixedSizeBinary(16, Some(bytes.clone())));
+        assert_eq!(datum, Some(Datum::fixed(bytes)));
+
+        let datum = super::scalar_value_to_datum(&ScalarValue::FixedSizeBinary(16, None));
+        assert_eq!(datum, None);
+    }
+
+    #[test]
+    fn test_predicate_conversion_with_fixed_size_binary() {
+        use datafusion::common::ScalarValue;
+        use datafusion::prelude::{col, lit};
+
+        let bytes = vec![1u8, 2u8, 3u8, 4u8];
+        let expr = col("key").eq(lit(ScalarValue::FixedSizeBinary(4, Some(bytes.clone()))));
+        let predicate = convert_filters_to_predicate(&[expr]).unwrap();
+        assert_eq!(
+            predicate,
+            Reference::new("key").equal_to(Datum::fixed(bytes))
+        );
     }
 
     #[test]
