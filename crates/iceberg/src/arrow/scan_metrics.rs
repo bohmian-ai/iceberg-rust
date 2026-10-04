@@ -50,15 +50,37 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 }
 
 /// Metrics collected during an Iceberg scan.
+///
+/// Counters are shared by every clone and are updated while the scan's
+/// record batch stream is polled, so read them after the stream is drained.
+///
+/// Row-group pruning counters are attributable per mechanism: a row group
+/// is counted under exactly one of [`Self::row_groups_pruned_by_statistics`]
+/// or [`Self::row_groups_pruned_by_bloom_filter`], because Bloom filters are
+/// only probed for row groups that survived statistics pruning. The row
+/// groups that were read are `considered - pruned_by_statistics -
+/// pruned_by_bloom_filter`.
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    pruning: Arc<PruningCounters>,
+}
+
+/// Per-mechanism predicate pruning counters shared by clones of
+/// [`ScanMetrics`].
+#[derive(Debug, Default)]
+struct PruningCounters {
+    row_groups_considered: AtomicU64,
+    row_groups_pruned_by_statistics: AtomicU64,
+    row_groups_pruned_by_bloom_filter: AtomicU64,
+    rows_pruned_by_page_index: AtomicU64,
 }
 
 impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            pruning: Arc::default(),
         }
     }
 
@@ -69,6 +91,64 @@ impl ScanMetrics {
     /// Total bytes read from storage during this scan, including data files and delete files.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Row groups that predicate pruning evaluated: for every data file task
+    /// that carries a predicate (scan filter and/or equality deletes), the
+    /// row groups assigned to that task's byte range.
+    pub fn row_groups_considered(&self) -> u64 {
+        self.pruning.row_groups_considered.load(Ordering::Relaxed)
+    }
+
+    /// Considered row groups excluded by row-group min/max and null-count
+    /// statistics.
+    pub fn row_groups_pruned_by_statistics(&self) -> u64 {
+        self.pruning
+            .row_groups_pruned_by_statistics
+            .load(Ordering::Relaxed)
+    }
+
+    /// Row groups that survived statistics pruning and were then excluded
+    /// because a Parquet split-block Bloom filter proved every equality or
+    /// `IN` probe value absent.
+    pub fn row_groups_pruned_by_bloom_filter(&self) -> u64 {
+        self.pruning
+            .row_groups_pruned_by_bloom_filter
+            .load(Ordering::Relaxed)
+    }
+
+    /// Rows in surviving row groups that the page index (column and offset
+    /// index) row selection skipped. Rows skipped only by positional deletes
+    /// are not counted.
+    pub fn rows_pruned_by_page_index(&self) -> u64 {
+        self.pruning
+            .rows_pruned_by_page_index
+            .load(Ordering::Relaxed)
+    }
+
+    /// Adds `count` row groups to [`Self::row_groups_considered`].
+    pub(crate) fn record_row_groups_considered(&self, count: usize) {
+        Self::add(&self.pruning.row_groups_considered, count);
+    }
+
+    /// Adds `count` row groups to [`Self::row_groups_pruned_by_statistics`].
+    pub(crate) fn record_row_groups_pruned_by_statistics(&self, count: usize) {
+        Self::add(&self.pruning.row_groups_pruned_by_statistics, count);
+    }
+
+    /// Adds `count` row groups to [`Self::row_groups_pruned_by_bloom_filter`].
+    pub(crate) fn record_row_groups_pruned_by_bloom_filter(&self, count: usize) {
+        Self::add(&self.pruning.row_groups_pruned_by_bloom_filter, count);
+    }
+
+    /// Adds `count` rows to [`Self::rows_pruned_by_page_index`].
+    pub(crate) fn record_rows_pruned_by_page_index(&self, count: usize) {
+        Self::add(&self.pruning.rows_pruned_by_page_index, count);
+    }
+
+    /// Adds a `usize` count to a relaxed atomic counter.
+    fn add(counter: &AtomicU64, count: usize) {
+        counter.fetch_add(count as u64, Ordering::Relaxed);
     }
 }
 

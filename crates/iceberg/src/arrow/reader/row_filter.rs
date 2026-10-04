@@ -16,21 +16,23 @@
 // under the License.
 
 //! Predicate-driven row filtering for `ArrowReader`: constructing Arrow `RowFilter`s
-//! from Iceberg predicates, row-group selection based on column statistics, and
-//! row-selection via the Parquet page index. Also includes byte-range row-group
+//! from Iceberg predicates, row-group selection based on column statistics and
+//! Bloom filters, and row-selection via the Parquet page index. Also includes byte-range row-group
 //! filtering used for file splitting.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection};
+use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
 use crate::error::Result;
 use crate::expr::BoundPredicate;
+use crate::expr::visitors::bloom_filter_evaluator::BloomFilterEvaluator;
 use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
@@ -87,6 +89,73 @@ impl ArrowReader {
         }
 
         Ok(results)
+    }
+
+    /// Returns the `candidates` row groups whose Parquet Bloom filters cannot
+    /// rule out `predicate`, preserving their order.
+    ///
+    /// Callers pass only row groups that already survived statistics
+    /// pruning, so each exclusion here is attributable to a Bloom filter.
+    /// For every candidate, the equality and `IN` columns that declare a
+    /// Bloom filter are fetched with one ranged read each through the
+    /// builder's file reader (and therefore counted in `bytes_read`), then
+    /// evaluated by [`BloomFilterEvaluator`]. A filter that is missing or
+    /// cannot be read keeps the row group, so this never excludes a matching
+    /// row and never fails the scan because of index evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if visiting the bound predicate fails.
+    pub(super) async fn prune_row_groups_by_bloom_filter<T>(
+        builder: &mut ParquetRecordBatchStreamBuilder<T>,
+        predicate: &BoundPredicate,
+        candidates: Vec<usize>,
+        field_id_map: &HashMap<i32, usize>,
+    ) -> Result<Vec<usize>>
+    where
+        T: AsyncFileReader + Send + 'static,
+    {
+        let predicate = predicate.clone().rewrite_not();
+        let parquet_metadata = Arc::clone(builder.metadata());
+        let mut kept = Vec::with_capacity(candidates.len());
+
+        for row_group in candidates {
+            let row_group_metadata = parquet_metadata.row_group(row_group);
+            let columns =
+                BloomFilterEvaluator::probe_columns(&predicate, row_group_metadata, field_id_map)?;
+
+            let mut bloom_filters = HashMap::with_capacity(columns.len());
+            for column in columns {
+                match builder
+                    .get_row_group_column_bloom_filter(row_group, column)
+                    .await
+                {
+                    Ok(Some(bloom_filter)) => {
+                        bloom_filters.insert(column, bloom_filter);
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::debug!(
+                        row_group,
+                        column,
+                        %error,
+                        "Parquet Bloom filter unreadable; keeping row group"
+                    ),
+                }
+            }
+
+            if bloom_filters.is_empty()
+                || BloomFilterEvaluator::eval(
+                    &predicate,
+                    row_group_metadata,
+                    field_id_map,
+                    &bloom_filters,
+                )?
+            {
+                kept.push(row_group);
+            }
+        }
+
+        Ok(kept)
     }
 
     /// Computes a [`RowSelection`] by evaluating the filter predicate against
@@ -217,16 +286,20 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, LargeStringArray, RecordBatch,
+        StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
+    use parquet::bloom_filter::Sbbf;
     use parquet::file::metadata::{FileMetaData, ParquetMetaData, ParquetMetaDataBuilder};
-    use parquet::file::properties::{EnabledStatistics, WriterProperties};
+    use parquet::file::properties::{EnabledStatistics, ReaderProperties, WriterProperties};
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::{ReadOptionsBuilder, SerializedFileReader};
     use parquet::schema::parser::parse_message_type;
-    use parquet::schema::types::SchemaDescriptor;
+    use parquet::schema::types::{ColumnPath, SchemaDescriptor};
     use tempfile::TempDir;
 
     use crate::Runtime;
@@ -1294,5 +1367,343 @@ mod tests {
             vec![2, 4, 5],
             "positional deletes must be applied correctly even when page indexes are absent"
         );
+    }
+
+    /// Rows written to each row group of the Bloom filter fixture.
+    const BLOOM_ROWS_PER_GROUP: usize = 100;
+
+    /// Row groups written to the Bloom filter fixture.
+    const BLOOM_ROW_GROUPS: usize = 3;
+
+    /// Returns the 16-byte trace id of slot `k` in row group `group`.
+    ///
+    /// Only even slots are written, so an odd slot lies strictly inside its
+    /// row group's min/max range while being absent from the data.
+    fn bloom_trace_id(group: usize, k: usize) -> Vec<u8> {
+        let mut id = vec![0u8; 16];
+        id[0] = group as u8;
+        id[14..].copy_from_slice(&(k as u16).to_be_bytes());
+        id
+    }
+
+    /// Returns the service name of slot `k` in row group `group`; ordered
+    /// like [`bloom_trace_id`] so odd slots fall inside the row group range.
+    fn bloom_service(group: usize, k: usize) -> String {
+        format!("svc-{group}-{k:03}")
+    }
+
+    /// Returns the `seq` value written for slot `k` in row group `group`.
+    fn bloom_seq(group: usize, k: usize) -> i64 {
+        (group * 1000 + k) as i64
+    }
+
+    /// Iceberg schema of the Bloom filter fixture.
+    fn bloom_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "trace_id", Type::Primitive(PrimitiveType::Fixed(16)))
+                        .into(),
+                    NestedField::required(2, "service", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::required(3, "seq", Type::Primitive(PrimitiveType::Long)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Writes [`BLOOM_ROW_GROUPS`] row groups of [`BLOOM_ROWS_PER_GROUP`]
+    /// rows (even slots only) with 25-row pages, declaring split-block Bloom
+    /// filters on `trace_id` and `service` when `bloom_filters` is set, and
+    /// returns the file path.
+    fn write_bloom_fixture(dir: &TempDir, bloom_filters: bool) -> String {
+        let field = |name: &str, data_type: DataType, id: &str| {
+            Field::new(name, data_type, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        };
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            field("trace_id", DataType::FixedSizeBinary(16), "1"),
+            field("service", DataType::Utf8, "2"),
+            field("seq", DataType::Int64, "3"),
+        ]));
+
+        let slots: Vec<(usize, usize)> = (0..BLOOM_ROW_GROUPS)
+            .flat_map(|group| (0..BLOOM_ROWS_PER_GROUP).map(move |row| (group, row * 2)))
+            .collect();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(
+                    slots.iter().map(|&(group, k)| bloom_trace_id(group, k)),
+                )
+                .unwrap(),
+            ) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(
+                slots.iter().map(|&(group, k)| bloom_service(group, k)),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values(
+                slots.iter().map(|&(group, k)| bloom_seq(group, k)),
+            )) as ArrayRef,
+        ])
+        .unwrap();
+
+        let mut props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(BLOOM_ROWS_PER_GROUP))
+            .set_data_page_row_count_limit(25)
+            .set_write_batch_size(25);
+        if bloom_filters {
+            for column in ["trace_id", "service"] {
+                props = props
+                    .set_column_bloom_filter_enabled(ColumnPath::from(column), true)
+                    .set_column_bloom_filter_max_ndv(ColumnPath::from(column), 1000)
+                    .set_column_bloom_filter_fpp(ColumnPath::from(column), 0.01);
+            }
+        }
+
+        let path = format!("{}/bloom.parquet", dir.path().to_str().unwrap());
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            arrow_schema,
+            Some(props.build()),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    /// Reads the Bloom filter the fixture wrote for `column` of `row_group`.
+    fn fixture_bloom_filter(path: &str, row_group: usize, column: usize) -> Option<Sbbf> {
+        let options = ReadOptionsBuilder::new()
+            .with_reader_properties(
+                ReaderProperties::builder()
+                    .set_read_bloom_filter(true)
+                    .build(),
+            )
+            .build();
+        let reader =
+            SerializedFileReader::new_with_options(File::open(path).unwrap(), options).unwrap();
+        assert_eq!(reader.num_row_groups(), BLOOM_ROW_GROUPS);
+        reader
+            .get_row_group(row_group)
+            .unwrap()
+            .get_column_bloom_filter(column)
+            .cloned()
+    }
+
+    /// Scans the fixture at `path` with `predicate` and returns the sorted
+    /// `seq` values read plus the scan's metrics.
+    async fn scan_bloom_fixture(
+        path: &str,
+        predicate: Predicate,
+        reader: ArrowReader,
+    ) -> (Vec<i64>, crate::arrow::ScanMetrics) {
+        let schema = bloom_schema();
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            data_file_path: path.to_string(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: schema.clone(),
+            project_field_ids: vec![3],
+            predicate: Some(predicate.bind(schema, true).unwrap()),
+            deletes: vec![],
+            sequence_number: 0,
+            file_sequence_number: None,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            unified_partition_type: None,
+            case_sensitive: false,
+            key_metadata: None,
+        };
+        let result = reader
+            .read(Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream)
+            .unwrap();
+        let metrics = result.metrics().clone();
+        let batches: Vec<RecordBatch> = result.stream().try_collect().await.unwrap();
+        let mut seqs: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        seqs.sort_unstable();
+        (seqs, metrics)
+    }
+
+    /// Builds a reader over the local filesystem with the given Bloom filter
+    /// and row selection switches.
+    fn bloom_reader(bloom_filter_enabled: bool, row_selection_enabled: bool) -> ArrowReader {
+        ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_bloom_filter_enabled(bloom_filter_enabled)
+            .with_row_selection_enabled(row_selection_enabled)
+            .build()
+    }
+
+    /// Asserts the per-mechanism row-group counters of one single-file scan.
+    fn assert_row_group_pruning(
+        metrics: &crate::arrow::ScanMetrics,
+        statistics: u64,
+        bloom_filter: u64,
+    ) {
+        assert_eq!(metrics.row_groups_considered(), BLOOM_ROW_GROUPS as u64);
+        assert_eq!(
+            metrics.row_groups_pruned_by_statistics(),
+            statistics,
+            "statistics-pruned row groups"
+        );
+        assert_eq!(
+            metrics.row_groups_pruned_by_bloom_filter(),
+            bloom_filter,
+            "Bloom-pruned row groups"
+        );
+    }
+
+    /// A 16-byte trace id absent from row group 1 but inside its min/max
+    /// range survives statistics and is pruned by the Bloom filter, while a
+    /// present id still returns its exact row; an `IN` of two in-range absent
+    /// ids prunes both surviving row groups, and a conjunction with a range
+    /// predicate keeps the Bloom decision.
+    #[tokio::test]
+    async fn bloom_filter_prunes_fixed_len_trace_id_inside_statistics_range() {
+        let dir = TempDir::new().unwrap();
+        let path = write_bloom_fixture(&dir, true);
+        let absent_1 = bloom_trace_id(1, 51);
+        let absent_2 = bloom_trace_id(2, 77);
+        let filter_1 = fixture_bloom_filter(&path, 1, 0).expect("trace_id Bloom filter");
+        let filter_2 = fixture_bloom_filter(&path, 2, 0).expect("trace_id Bloom filter");
+        assert!(
+            !filter_1.check(absent_1.as_slice()),
+            "probe must be Bloom-negative"
+        );
+        assert!(
+            !filter_2.check(absent_2.as_slice()),
+            "probe must be Bloom-negative"
+        );
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("trace_id").equal_to(Datum::fixed(absent_1.clone())),
+            bloom_reader(true, false),
+        )
+        .await;
+        assert!(seqs.is_empty());
+        assert_row_group_pruning(&metrics, 2, 1);
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("trace_id").equal_to(Datum::fixed(bloom_trace_id(1, 50))),
+            bloom_reader(true, false),
+        )
+        .await;
+        assert_eq!(seqs, vec![bloom_seq(1, 50)]);
+        assert_row_group_pruning(&metrics, 2, 0);
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("trace_id")
+                .is_in([Datum::fixed(absent_1.clone()), Datum::fixed(absent_2)])
+                .and(Reference::new("seq").greater_than_or_equal_to(Datum::long(0))),
+            bloom_reader(true, false),
+        )
+        .await;
+        assert!(seqs.is_empty());
+        assert_row_group_pruning(&metrics, 1, 2);
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("trace_id")
+                .equal_to(Datum::fixed(absent_1.clone()))
+                .or(Reference::new("seq").equal_to(Datum::long(bloom_seq(1, 4)))),
+            bloom_reader(true, false),
+        )
+        .await;
+        assert_eq!(seqs, vec![bloom_seq(1, 4)]);
+        assert_row_group_pruning(&metrics, 2, 0);
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("trace_id").equal_to(Datum::fixed(absent_1)),
+            bloom_reader(false, false),
+        )
+        .await;
+        assert!(seqs.is_empty());
+        assert_row_group_pruning(&metrics, 2, 0);
+    }
+
+    /// A service name absent from row group 1 but inside its min/max range
+    /// is pruned by the string column's Bloom filter, while a present name
+    /// returns its exact row.
+    #[tokio::test]
+    async fn bloom_filter_prunes_string_inside_statistics_range() {
+        let dir = TempDir::new().unwrap();
+        let path = write_bloom_fixture(&dir, true);
+        let absent = bloom_service(1, 51);
+        let filter = fixture_bloom_filter(&path, 1, 1).expect("service Bloom filter");
+        assert!(
+            !filter.check(absent.as_str()),
+            "probe must be Bloom-negative"
+        );
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("service").equal_to(Datum::string(&absent)),
+            bloom_reader(true, false),
+        )
+        .await;
+        assert!(seqs.is_empty());
+        assert_row_group_pruning(&metrics, 2, 1);
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("service").equal_to(Datum::string(bloom_service(1, 50))),
+            bloom_reader(true, false),
+        )
+        .await;
+        assert_eq!(seqs, vec![bloom_seq(1, 50)]);
+        assert_row_group_pruning(&metrics, 2, 0);
+    }
+
+    /// Without written Bloom filters nothing is Bloom-pruned and results
+    /// stay exact; with the page index enabled, a present id selects one
+    /// 25-row page of its row group and the other 75 rows are attributed to
+    /// the page index.
+    #[tokio::test]
+    async fn bloom_filter_absent_keeps_row_groups_and_page_index_is_attributed() {
+        let dir = TempDir::new().unwrap();
+        let path = write_bloom_fixture(&dir, false);
+        assert!(fixture_bloom_filter(&path, 1, 0).is_none());
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("trace_id").equal_to(Datum::fixed(bloom_trace_id(1, 51))),
+            bloom_reader(true, false),
+        )
+        .await;
+        assert!(seqs.is_empty());
+        assert_row_group_pruning(&metrics, 2, 0);
+        assert_eq!(metrics.rows_pruned_by_page_index(), 0);
+
+        let (seqs, metrics) = scan_bloom_fixture(
+            &path,
+            Reference::new("trace_id").equal_to(Datum::fixed(bloom_trace_id(1, 50))),
+            bloom_reader(true, true),
+        )
+        .await;
+        assert_eq!(seqs, vec![bloom_seq(1, 50)]);
+        assert_row_group_pruning(&metrics, 2, 0);
+        assert_eq!(metrics.rows_pruned_by_page_index(), 75);
     }
 }

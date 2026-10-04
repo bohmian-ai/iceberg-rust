@@ -71,6 +71,7 @@ impl ArrowReader {
                 .with_scan_metrics(scan_metrics.clone()),
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
             metadata_loader: self.metadata_loader,
@@ -125,6 +126,7 @@ struct FileScanTaskReader {
     delete_file_loader: CachingDeleteFileLoader,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
     metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
@@ -626,6 +628,16 @@ impl FileScanTaskReader {
             )?;
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
 
+            // Row groups in this task's byte range are the ones predicate pruning
+            // considers; each pruning mechanism below only sees the survivors of the
+            // previous one, so its counter is attributable to that mechanism alone.
+            let considered_row_groups = selected_row_group_indices.as_ref().map_or_else(
+                || record_batch_stream_builder.metadata().num_row_groups(),
+                Vec::len,
+            );
+            self.scan_metrics
+                .record_row_groups_considered(considered_row_groups);
+
             if self.row_group_filtering_enabled {
                 let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
                     &predicate,
@@ -636,17 +648,40 @@ impl FileScanTaskReader {
 
                 // Merge predicate-based filtering with byte range filtering (if present)
                 // by taking the intersection of both filters
-                selected_row_group_indices = match selected_row_group_indices {
+                let surviving_row_groups = match selected_row_group_indices {
                     Some(byte_range_filtered) => {
                         // Keep only row groups that are in both filters
-                        let intersection: Vec<usize> = byte_range_filtered
+                        byte_range_filtered
                             .into_iter()
                             .filter(|idx| predicate_filtered_row_groups.contains(idx))
-                            .collect();
-                        Some(intersection)
+                            .collect()
                     }
-                    None => Some(predicate_filtered_row_groups),
+                    None => predicate_filtered_row_groups,
                 };
+                self.scan_metrics.record_row_groups_pruned_by_statistics(
+                    considered_row_groups - surviving_row_groups.len(),
+                );
+                selected_row_group_indices = Some(surviving_row_groups);
+            }
+
+            if self.bloom_filter_enabled {
+                let candidates = selected_row_group_indices.clone().unwrap_or_else(|| {
+                    (0..record_batch_stream_builder.metadata().num_row_groups()).collect()
+                });
+                let candidate_count = candidates.len();
+                let surviving_row_groups = ArrowReader::prune_row_groups_by_bloom_filter(
+                    &mut record_batch_stream_builder,
+                    &predicate,
+                    candidates,
+                    &field_id_map,
+                )
+                .await?;
+                let bloom_pruned = candidate_count - surviving_row_groups.len();
+                self.scan_metrics
+                    .record_row_groups_pruned_by_bloom_filter(bloom_pruned);
+                if bloom_pruned > 0 {
+                    selected_row_group_indices = Some(surviving_row_groups);
+                }
             }
 
             if self.row_selection_enabled {
@@ -657,6 +692,10 @@ impl FileScanTaskReader {
                     &field_id_map,
                     &task.schema,
                 )?;
+                if let Some(page_index_selection) = &row_selection {
+                    self.scan_metrics
+                        .record_rows_pruned_by_page_index(page_index_selection.skipped_row_count());
+                }
             }
         }
 

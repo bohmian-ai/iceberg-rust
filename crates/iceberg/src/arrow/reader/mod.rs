@@ -79,6 +79,7 @@ pub struct ArrowReaderBuilder {
     concurrency_limit_data_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
     metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
@@ -95,6 +96,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            bloom_filter_enabled: true,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
             metadata_loader: None,
@@ -130,6 +132,22 @@ impl ArrowReaderBuilder {
     /// Determines whether to enable row selection.
     pub fn with_row_selection_enabled(mut self, row_selection_enabled: bool) -> Self {
         self.row_selection_enabled = row_selection_enabled;
+        self
+    }
+
+    /// Determines whether to prune row groups with Parquet Bloom filters.
+    ///
+    /// When enabled (the default), every row group that survives
+    /// statistics-based row-group filtering is probed against the
+    /// split-block Bloom filters the writer declared for columns used in
+    /// equality and `IN` predicates; a row group is skipped only when the
+    /// filters prove no probe value can be present. Columns without a Bloom
+    /// filter, unsupported types, and unreadable filters keep the row group.
+    /// Each probed filter costs one extra ranged read per row group and
+    /// column, so disable this when predicates rarely target filtered
+    /// columns.
+    pub fn with_bloom_filter_enabled(mut self, bloom_filter_enabled: bool) -> Self {
+        self.bloom_filter_enabled = bloom_filter_enabled;
         self
     }
 
@@ -172,6 +190,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
             metadata_loader: self.metadata_loader,
         }
@@ -190,6 +209,7 @@ pub struct ArrowReader {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
 }
