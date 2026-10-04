@@ -52,8 +52,11 @@ use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 ///   explicitly is an error, since
 ///   [`remove_snapshots`](crate::spec::TableMetadataBuilder::remove_snapshots) would otherwise
 ///   drop the ref silently.
+/// - [`explicit_ids_only`](Self::explicit_ids_only) disables every age-based rule above: only the
+///   named ids are removed and no ref is aged out.
 pub struct ExpireSnapshotsAction {
     explicit_ids_to_remove: Vec<i64>,
+    explicit_ids_only: bool,
     older_than_ms: Option<i64>,
     retain_last: Option<usize>,
     clear_expired_meta_data: bool,
@@ -63,6 +66,7 @@ impl ExpireSnapshotsAction {
     pub(crate) fn new() -> Self {
         Self {
             explicit_ids_to_remove: vec![],
+            explicit_ids_only: false,
             older_than_ms: None,
             retain_last: None,
             clear_expired_meta_data: false,
@@ -81,6 +85,18 @@ impl ExpireSnapshotsAction {
     /// [`commit`](TransactionAction::commit) to fail.
     pub fn expire_snapshot_ids(mut self, snapshot_ids: impl IntoIterator<Item = i64>) -> Self {
         self.explicit_ids_to_remove.extend(snapshot_ids);
+        self
+    }
+
+    /// Restrict expiry to the ids named via [`expire_snapshot_ids`](Self::expire_snapshot_ids).
+    ///
+    /// When enabled, no snapshot is selected by age and no branch or tag is aged out, so
+    /// [`expire_older_than_ms`](Self::expire_older_than_ms), [`retain_last`](Self::retain_last), and
+    /// the table's `history.expire.*` properties have no effect on the removal set. Naming the
+    /// current snapshot or the head of any branch or tag still fails the commit; ids not present in
+    /// the table are ignored.
+    pub fn explicit_ids_only(mut self, explicit_ids_only: bool) -> Self {
+        self.explicit_ids_only = explicit_ids_only;
         self
     }
 
@@ -133,11 +149,12 @@ impl ExpireSnapshotsAction {
 
         // Ref aging: `main` is always kept; any other ref whose head is older than its
         // `max_ref_age_ms` (defaulting to `history.expire.max-ref-age-ms`) is dropped, like Java's
-        // `computeRetainedRefs`.
+        // `computeRetainedRefs`. Explicit-id-only mode retains every ref.
         let mut removed_ref_names: Vec<String> = vec![];
         let mut retained_refs: Vec<&SnapshotReference> = vec![];
         for (ref_name, snapshot_ref) in &metadata.refs {
-            if ref_name == MAIN_BRANCH
+            if self.explicit_ids_only
+                || ref_name == MAIN_BRANCH
                 || !Self::ref_aged_out(metadata, snapshot_ref, now, properties.max_ref_age_ms)
             {
                 retained_refs.push(snapshot_ref);
@@ -162,6 +179,14 @@ impl ExpireSnapshotsAction {
             if existing_ids.contains(id) {
                 expiring_ids.insert(*id);
             }
+        }
+        if self.explicit_ids_only {
+            let mut ids_to_remove: Vec<i64> = expiring_ids.into_iter().collect();
+            ids_to_remove.sort_unstable();
+            return Ok(ExpirePlan {
+                ids_to_remove,
+                refs_to_remove: vec![],
+            });
         }
 
         // Per-branch retention: keep each branch's most recent `min_to_keep` ancestors plus any
@@ -1124,6 +1149,97 @@ mod tests {
         )
         .await;
         assert_eq!(removed, vec![1, 2]);
+    }
+
+    /// Old chain 1 -> 2 -> 5 -> 3 on main plus an old orphan 4, an old tag on 1, and an old branch on
+    /// 2, all with 1-day ref windows and a 1-day table snapshot age so every age rule would fire.
+    fn table_with_old_history() -> Table {
+        let now = Utc::now().timestamp_millis();
+        let day_ms = 24 * 60 * 60 * 1000;
+        table_with_props(
+            vec![
+                snapshot(4, None, 34, now - 40 * day_ms),
+                snapshot(1, None, 35, now - 30 * day_ms),
+                snapshot(2, Some(1), 36, now - 20 * day_ms),
+                snapshot(5, Some(2), 37, now - 15 * day_ms),
+                snapshot(3, Some(5), 38, now - 10 * day_ms),
+            ],
+            vec![
+                ("old-tag", tag(1, Some(day_ms))),
+                (
+                    "old-branch",
+                    branch_with(2, None, Some(day_ms), Some(day_ms)),
+                ),
+                (MAIN_BRANCH, branch(3, None)),
+            ],
+            HashMap::from([
+                (
+                    "history.expire.max-snapshot-age-ms".to_string(),
+                    day_ms.to_string(),
+                ),
+                (
+                    "history.expire.min-snapshots-to-keep".to_string(),
+                    "1".to_string(),
+                ),
+            ]),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_explicit_ids_only_removes_exactly_the_named_ids() {
+        let table = table_with_old_history();
+        // Sanity: without the flag, age and ref aging would remove far more.
+        let aged = updates_of(&table, action().expire_snapshot_ids(vec![5])).await;
+        assert!(!removed_refs(&aged).is_empty());
+
+        let updates = updates_of(
+            &table,
+            action()
+                .explicit_ids_only(true)
+                .expire_snapshot_ids(vec![5, 42])
+                .retain_last(10)
+                .expire_older_than_ms(i64::MAX),
+        )
+        .await;
+        // Only 5 is removed: old orphan 4 is not selected by age, no ref is aged out, retain_last
+        // does not protect 5, and unknown 42 is ignored.
+        assert!(removed_refs(&updates).is_empty());
+        assert!(updates.iter().all(|u| matches!(
+            u,
+            TableUpdate::RemoveSnapshots { snapshot_ids } if snapshot_ids == &[5]
+        )));
+        assert_eq!(updates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_explicit_ids_only_preserves_unlisted_old_snapshot_and_refs() {
+        let table = table_with_old_history();
+        let updates = updates_of(&table, action().explicit_ids_only(true)).await;
+        assert!(updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_explicit_ids_only_rejects_current_snapshot() {
+        let table = table_with_old_history();
+        let action = action()
+            .explicit_ids_only(true)
+            .expire_snapshot_ids(vec![3]);
+        let err = Arc::new(action).commit(&table).await.err().unwrap();
+        assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+        assert!(err.message().contains("current snapshot"));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_ids_only_rejects_ref_heads_even_when_aged() {
+        let table = table_with_old_history();
+        for head in [1, 2] {
+            let action = action()
+                .explicit_ids_only(true)
+                .expire_snapshot_ids(vec![head]);
+            let err = Arc::new(action).commit(&table).await.err().unwrap();
+            assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+            assert!(err.message().contains("still referenced by"));
+        }
     }
 
     #[tokio::test]
