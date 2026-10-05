@@ -2198,6 +2198,130 @@ mod tests {
         pretty_assertions::assert_eq!(converted, expected);
     }
 
+    /// An unshredded Arrow Variant field survives Arrow -> Iceberg -> Arrow unchanged, extension
+    /// included, and a Parquet write through `ParquetWriter` read back through `ArrowReader`
+    /// returns the same field and the same metadata/value bytes for every row.
+    #[tokio::test]
+    async fn variant_round_trips_unshredded() {
+        use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, RecordBatch, StructArray};
+        use futures::TryStreamExt;
+        use parquet::file::properties::WriterProperties;
+
+        use crate::Runtime;
+        use crate::arrow::ArrowReaderBuilder;
+        use crate::io::FileIO;
+        use crate::scan::{FileScanTask, FileScanTaskStream};
+        use crate::spec::DataFileFormat;
+        use crate::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
+
+        let id_field = simple_field("id", DataType::Int64, false, "1");
+        let variant_field = simple_field("v", variant_storage(), true, "2")
+            .with_extension_type(VariantExtensionType);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![id_field, variant_field.clone()]));
+
+        let iceberg_schema = Arc::new(arrow_schema_to_schema(&arrow_schema).unwrap());
+        assert_eq!(
+            iceberg_schema.field_by_id(2).unwrap().field_type.as_ref(),
+            &Type::Variant(VariantType)
+        );
+        let back = schema_to_arrow_schema(&iceberg_schema).unwrap();
+        pretty_assertions::assert_eq!(back.field(1), &variant_field);
+
+        let metadata: Vec<&[u8]> = vec![&[0x01, 0x00, 0x00], &[0x01, 0x01, 0x00, 0x01, 0x61]];
+        let values: Vec<&[u8]> = vec![&[0x0c, 0x2a], &[0x02, 0x01, 0x00, 0x00, 0x02, 0x0c, 0x07]];
+        let DataType::Struct(storage) = variant_storage() else {
+            unreachable!("variant storage is a struct")
+        };
+        let variant = StructArray::new(
+            storage,
+            vec![
+                Arc::new(BinaryArray::from_vec(metadata.clone())) as ArrayRef,
+                Arc::new(BinaryArray::from_vec(values.clone())) as ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int64Array::from(vec![10, 11])) as ArrayRef,
+            Arc::new(variant) as ArrayRef,
+        ])
+        .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = format!("{}/variant.parquet", dir.path().to_str().unwrap());
+        let file_io = FileIO::new_with_fs();
+        let mut writer =
+            ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone())
+                .build(file_io.new_output(&path).unwrap())
+                .await
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            data_file_path: path.clone(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: iceberg_schema.clone(),
+            project_field_ids: vec![1, 2],
+            predicate: None,
+            deletes: vec![],
+            sequence_number: 0,
+            file_sequence_number: None,
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            unified_partition_type: None,
+            case_sensitive: false,
+            key_metadata: None,
+        };
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let read: Vec<RecordBatch> = ArrowReaderBuilder::new(file_io, Runtime::current())
+            .build()
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 1);
+        let read = &read[0];
+
+        pretty_assertions::assert_eq!(read.schema().field(1), &variant_field);
+        let read_variant = read
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(read_variant.null_count(), 0);
+        let read_metadata = read_variant
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let read_values = read_variant
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for row in 0..2 {
+            assert_eq!(read_metadata.value(row), metadata[row]);
+            assert_eq!(read_values.value(row), values[row]);
+        }
+        assert_eq!(
+            read.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[10, 11]
+        );
+    }
+
     #[test]
     fn test_variant_extension_on_non_struct_storage_is_rejected() {
         // The extension may only sit on struct storage. A hand-injected tag on a
