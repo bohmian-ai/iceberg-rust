@@ -1049,21 +1049,23 @@ mod tests {
         assert_eq!(visitor.name_to_id, expect);
     }
 
-    /// Each rolled output of the deferred Variant writer infers its own layout from its own rows.
+    /// Every rolled output of the Variant writer uses the one layout it was built with.
     ///
-    /// The prefix bound is two rows and the roll target one byte, so each
+    /// The layout shreds `a` and `b`, and the roll target is one byte, so each
     /// two-row batch lands in its own output. Output 1 holds only `{"a": int}`
-    /// objects and output 2 only `{"b": string}` objects, so each file must
-    /// shred exactly its own field; every value must read back unchanged and
-    /// the `DataFile` metrics must stay logical.
+    /// objects and output 2 only `{"b": string}` objects; both files must
+    /// shred both fields, every value must read back unchanged, and the
+    /// `DataFile` metrics must stay logical.
     #[tokio::test]
-    async fn variant_builder_infers_each_rolled_output() -> Result<()> {
+    async fn variant_builder_shreds_every_rolled_output_with_one_layout() -> Result<()> {
         use parquet::variant::{VariantArray, json_to_variant, unshred_variant, variant_to_json};
 
         use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
         use crate::writer::file_writer::VariantParquetWriterBuilder;
         use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-        use crate::writer::file_writer::variant_shredding::VariantShreddingPolicy;
+        use crate::writer::file_writer::variant_shredding::{
+            VariantSampler, VariantShreddingPolicy,
+        };
         use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
         let temp_dir = TempDir::new().unwrap();
@@ -1088,18 +1090,29 @@ mod tests {
             ])
             .unwrap()
         };
-        let policy = VariantShreddingPolicy {
-            max_rows: 2,
-            max_bytes: usize::MAX,
-            min_frequency_percent: 10,
-            max_tracked_children: 1_000,
-            max_emitted_children: 300,
-            max_depth: 50,
-        };
+        let first = batch([1, 2], [r#"{"a":1}"#, r#"{"a":300}"#]);
+        let second = batch([3, 4], [r#"{"b":"x"}"#, r#"{"b":"y"}"#]);
+        let mut sampler = VariantSampler::new(
+            &arrow_schema,
+            VariantShreddingPolicy {
+                confidence_z: 2.5758,
+                margin: 0.02,
+                min_stratum_rows: 30,
+                min_frequency: 0.10,
+                max_tracked_children: 1_000,
+                max_emitted_children: 300,
+                max_depth: 50,
+            },
+            7,
+            &[4],
+        );
+        sampler.offer(&first, &[0, 0], 0)?;
+        sampler.offer(&second, &[0, 0], 2)?;
+        let layout = sampler.layout();
         let mut writer = DataFileWriterBuilder::new(RollingFileWriterBuilder::new(
             VariantParquetWriterBuilder::new(
                 ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone()),
-                policy,
+                layout,
             ),
             1,
             file_io.clone(),
@@ -1110,12 +1123,8 @@ mod tests {
         ))
         .build(None)
         .await?;
-        writer
-            .write(batch([1, 2], [r#"{"a":1}"#, r#"{"a":300}"#]))
-            .await?;
-        writer
-            .write(batch([3, 4], [r#"{"b":"x"}"#, r#"{"b":"y"}"#]))
-            .await?;
+        writer.write(first).await?;
+        writer.write(second).await?;
         let mut data_files = writer.close().await?;
         data_files.sort_by_key(|file| file.record_count());
         assert_eq!(data_files.len(), 2, "one output per batch");
@@ -1164,14 +1173,11 @@ mod tests {
                 Some(DataType::Struct(fields)) => {
                     fields.iter().map(|field| field.name().clone()).collect()
                 }
-                other => panic!("each output shreds its object fields, got {other:?}"),
+                other => panic!("each output shreds the layout's fields, got {other:?}"),
             })
             .collect();
-        let mut shredded_fields = shredded_fields;
-        shredded_fields.sort();
-        assert_eq!(shredded_fields, [vec!["a".to_string()], vec![
-            "b".to_string()
-        ]]);
+        let both = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(shredded_fields, [both.clone(), both]);
         Ok(())
     }
 

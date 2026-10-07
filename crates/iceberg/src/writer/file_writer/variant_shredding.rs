@@ -15,26 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Per-file Variant shredding chosen from a bounded prefix of the file's own rows.
+//! Variant shredding layouts chosen before a file's writer opens.
 //!
-//! A writer that shreds cannot open its Parquet encoder until it knows the
-//! physical layout, and it cannot know the layout until it has seen rows. A
-//! [`VariantPrefix`] holds the file's first rows within a row and byte bound,
-//! samples them, and then hands back the inferred [`VariantLayout`] together
-//! with the rows to replay once into the opened encoder. It performs no IO, so
-//! every writer that shreds shares it and keeps its own IO.
+//! A shredding writer cannot open its Parquet encoder until it knows the
+//! physical layout, so the layout is decided first and no rows are buffered:
 //!
-//! Arrow owns the standard encoding: the layout is built with
-//! [`ShreddedSchemaBuilder`] and applied with [`shred_variant`]. This module
-//! only decides which object fields to shred and as which type. Only top-level
-//! Variant columns are shredded; arrays always stay in the residual `value`.
+//! - [`VariantSampler`] picks a seeded, stratified sample of a whole input and
+//!   infers the layout from it. Scribe uses it over a claim's staged runs.
+//! - [`VariantLayout::combine`] merges the layouts other files already chose,
+//!   from the shredded-leaf counts in their footers. Forge uses it over a
+//!   rewrite's source files.
+//!
+//! Both perform no IO; callers keep their own. Arrow owns the standard
+//! encoding: the layout is built with [`ShreddedSchemaBuilder`] and applied
+//! with [`shred_variant`]. This module only decides which object fields to
+//! shred and as which type. Only top-level Variant columns are shredded;
+//! arrays always stay in the residual `value`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::extension::ExtensionType;
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
+use parquet::file::metadata::ParquetMetaData;
 use parquet::variant::{
     ShreddedSchemaBuilder, Variant, VariantArray, VariantPath, VariantPathElement, VariantType,
     shred_variant,
@@ -46,31 +50,53 @@ use crate::spec::DataFileBuilder;
 use crate::writer::CurrentFileStatus;
 use crate::{Error, ErrorKind, Result};
 
-/// Internal bounds and thresholds that decide one file's Variant layout.
+/// Internal sampling parameters and caps that decide a Variant layout.
 ///
 /// The values are supplied by the owning writer at construction. They are
-/// policy constants, not table or user configuration. The default has zero
-/// bounds: it samples nothing, so files are never shredded.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// policy constants, not table or user configuration. The default has a zero
+/// margin: it samples nothing, so files are never shredded.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct VariantShreddingPolicy {
-    /// Rows retained before the layout is inferred.
-    pub max_rows: usize,
-    /// Retained Arrow memory, in the writer's own measure, before the layout is inferred.
-    pub max_bytes: usize,
-    /// Minimum share of sampled non-null root values, in percent, that must contain a field.
-    pub min_frequency_percent: usize,
+    /// Standard-normal quantile of the sample's confidence level (2.5758 for 99%).
+    pub confidence_z: f64,
+    /// Margin of error on a sampled field frequency, as a fraction (0.02).
+    pub margin: f64,
+    /// Strata with fewer rows than this are merged into one shared stratum.
+    pub min_stratum_rows: usize,
+    /// Share of non-null root values, as a fraction, that must hold a field.
+    pub min_frequency: f64,
     /// Distinct child names tracked per object node; later names are ignored.
     pub max_tracked_children: usize,
-    /// Children kept per object node, by frequency then name.
+    /// Children kept per object node, by rows covered then name.
     pub max_emitted_children: usize,
     /// Object depth below which traversal stops.
     pub max_depth: usize,
 }
 
+impl VariantShreddingPolicy {
+    /// Rows to sample from a stratum of `rows` rows.
+    ///
+    /// Cochran's sample size for a proportion at the worst case `p = 0.5`,
+    /// `n0 = z² · 0.25 / e²`, with the finite-population correction
+    /// `n0 / (1 + (n0 − 1) / rows)`, rounded up and never above `rows`. A zero
+    /// margin samples nothing.
+    pub fn stratum_sample_size(&self, rows: usize) -> usize {
+        if self.margin <= 0.0 || rows == 0 {
+            return 0;
+        }
+        let n0 =
+            (self.confidence_z * self.confidence_z * 0.25 / (self.margin * self.margin)).ceil();
+        if n0 < 1.0 {
+            return 0;
+        }
+        let corrected = n0 / (1.0 + (n0 - 1.0) / rows as f64);
+        (corrected.ceil() as usize).min(rows)
+    }
+}
+
 /// One physical Variant layout per top-level Variant column of a file.
 ///
-/// An empty layout leaves every column unshredded. The layout is derived from
-/// this file's rows only and is never shared with another file.
+/// An empty layout leaves every column unshredded.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VariantLayout {
     /// Column index and the shredding type passed to [`shred_variant`].
@@ -141,151 +167,372 @@ impl VariantLayout {
             Error::new(ErrorKind::Unexpected, "Failed to assemble shredded batch.").with_source(err)
         })
     }
+
+    /// Combines the layouts `footers` already chose into one layout for files of `logical`.
+    ///
+    /// For each top-level Variant column, every source's shredded scalar leaf
+    /// counts its rows minus its null count: the exact rows holding that field
+    /// with that type. A leaf whose footer has no null count counts every row.
+    /// Counts are summed over all sources; types of one family widen together,
+    /// and across families the type covering more rows wins (the others go to
+    /// the residual). A field is kept when its combined count reaches
+    /// `min_frequency` of the combined non-null roots, then children are
+    /// capped per object node by rows covered, ties by name. This is a count,
+    /// not a sample, so the margin does not apply; a field no source shredded
+    /// is never shredded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a footer's schema cannot be read as Arrow.
+    pub fn combine(
+        logical: &Schema,
+        footers: &[Arc<ParquetMetaData>],
+        policy: &VariantShreddingPolicy,
+    ) -> Result<Self> {
+        let mut columns = Vec::new();
+        for (index, field) in variant_columns(logical) {
+            let mut roots = 0_usize;
+            let mut leaves: BTreeMap<Vec<String>, Vec<(Scalar, usize)>> = BTreeMap::new();
+            for footer in footers {
+                let counts = FooterCounts::new(footer, field.name())?;
+                roots += counts.present(&[field.name().as_str(), "metadata"]);
+                let Some(typed) = counts.typed_value_fields() else {
+                    continue;
+                };
+                let mut path = Vec::new();
+                counts.collect_leaves(&typed, &mut path, &mut leaves);
+            }
+            let mut root = ObjectNode::default();
+            for (path, typed) in leaves {
+                let Some((scalar, count)) = Scalar::winner(typed) else {
+                    continue;
+                };
+                root.insert_counted(&path, scalar, count);
+            }
+            let rules = [StratumRule {
+                min_count: ((roots as f64) * policy.min_frequency).ceil().max(1.0) as usize,
+                weight: 1.0,
+            }];
+            if let Some(shredding_type) = root.shredding_type(&rules, policy) {
+                columns.push((index, shredding_type));
+            }
+        }
+        Ok(VariantLayout { columns })
+    }
 }
 
-/// What a writer does after offering one batch to its [`VariantPrefix`].
-#[derive(Debug)]
-pub enum PrefixStep {
-    /// The whole batch was retained; keep sampling.
-    Retained,
-    /// A bound was reached: open the encoder with this layout and replay.
-    Ready(ReadyPrefix),
+/// The top-level Variant columns of `schema`, with their indices.
+fn variant_columns(schema: &Schema) -> impl Iterator<Item = (usize, &Arc<Field>)> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.extension_type_name() == Some(VariantType::NAME))
 }
 
-/// The inferred layout and the rows still to be written, in order.
-#[derive(Debug)]
-pub struct ReadyPrefix {
-    /// Physical layout for this file.
-    pub layout: VariantLayout,
-    /// Retained rows to write first, exactly once.
-    pub replay: Vec<RecordBatch>,
-    /// Rows of the offered batch that were not retained, written after `replay`.
-    pub remainder: Option<RecordBatch>,
+/// Shredded-leaf counts of one Variant column in one source footer.
+struct FooterCounts<'a> {
+    /// The source file's metadata.
+    footer: &'a ParquetMetaData,
+    /// Name of the Variant column.
+    column: &'a str,
+    /// Leaf column index by its full dotted path parts.
+    leaves: HashMap<Vec<&'a str>, usize>,
+    /// The column's Arrow storage type in this file.
+    storage: Option<DataType>,
 }
 
-/// Retains one file's first rows within the policy bounds and infers its layout.
-///
-/// The writer offers every batch through [`Self::push`] until it gets
-/// [`PrefixStep::Ready`], or calls [`Self::finish`] at close. A batch is
-/// measured with the writer's own memory measure before it is retained. The
-/// prefix stops before a batch would cross the byte bound; a first batch that
-/// alone crosses it is retained as the progress exception. Retained batches
-/// are zero-copy views of the offered batches and are handed back for replay,
-/// so dropping the prefix releases them.
-pub struct VariantPrefix {
-    /// Bounds and thresholds for this file.
-    policy: VariantShreddingPolicy,
-    /// The writer's memory measure for one batch.
-    measure: fn(&RecordBatch) -> usize,
-    /// Sample statistics per top-level Variant column.
-    analyzer: VariantLayoutAnalyzer,
-    /// Retained batches in arrival order.
-    retained: Vec<RecordBatch>,
-    /// Rows retained so far.
-    rows: usize,
-    /// Measured bytes retained so far.
-    bytes: usize,
-}
+impl<'a> FooterCounts<'a> {
+    /// Indexes the leaves of `column` in `footer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the footer's schema cannot be read as Arrow.
+    fn new(footer: &'a ParquetMetaData, column: &'a str) -> Result<Self> {
+        let descr = footer.file_metadata().schema_descr();
+        let leaves = descr
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, leaf)| leaf.path().parts().first().map(String::as_str) == Some(column))
+            .map(|(index, leaf)| {
+                (
+                    leaf.path().parts().iter().map(String::as_str).collect(),
+                    index,
+                )
+            })
+            .collect();
+        let arrow = parquet::arrow::parquet_to_arrow_schema(descr, None).map_err(|err| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Invalid Parquet schema in a source footer.",
+            )
+            .with_source(err)
+        })?;
+        let storage = arrow
+            .field_with_name(column)
+            .ok()
+            .map(|field| field.data_type().clone());
+        Ok(Self {
+            footer,
+            column,
+            leaves,
+            storage,
+        })
+    }
 
-impl VariantPrefix {
-    /// Starts an empty prefix for files of `schema`.
-    pub fn new(
-        schema: &Schema,
-        policy: VariantShreddingPolicy,
-        measure: fn(&RecordBatch) -> usize,
-    ) -> Self {
-        Self {
-            policy,
-            measure,
-            analyzer: VariantLayoutAnalyzer::new(schema, policy),
-            retained: Vec::new(),
-            rows: 0,
-            bytes: 0,
+    /// Rows whose leaf at `path` is not null, summed over row groups.
+    ///
+    /// A row group without a null count counts every row; a missing leaf counts none.
+    fn present(&self, path: &[&str]) -> usize {
+        let Some(&leaf) = self.leaves.get(path) else {
+            return 0;
+        };
+        self.footer
+            .row_groups()
+            .iter()
+            .map(|group| {
+                let rows = usize::try_from(group.num_rows()).unwrap_or(0);
+                let nulls = group
+                    .column(leaf)
+                    .statistics()
+                    .and_then(|stats| stats.null_count_opt())
+                    .map_or(0, |nulls| usize::try_from(nulls).unwrap_or(rows));
+                rows.saturating_sub(nulls)
+            })
+            .sum()
+    }
+
+    /// The fields of the column's top-level `typed_value` object, if it is shredded as one.
+    fn typed_value_fields(&self) -> Option<Fields> {
+        let DataType::Struct(storage) = self.storage.as_ref()? else {
+            return None;
+        };
+        match storage.find("typed_value")?.1.data_type() {
+            DataType::Struct(fields) => Some(fields.clone()),
+            _ => None,
         }
     }
 
-    /// Whether the file has no Variant column, so no prefix is needed.
+    /// Adds every shredded scalar leaf under `fields` at `path` to `leaves`.
+    ///
+    /// A shredded field is a struct of `value` and `typed_value`; its
+    /// `typed_value` is either a scalar leaf or a nested object. Anything else,
+    /// such as a shredded array, is skipped.
+    fn collect_leaves(
+        &self,
+        fields: &Fields,
+        path: &mut Vec<String>,
+        leaves: &mut BTreeMap<Vec<String>, Vec<(Scalar, usize)>>,
+    ) {
+        for field in fields {
+            let DataType::Struct(element) = field.data_type() else {
+                continue;
+            };
+            let Some((_, typed)) = element.find("typed_value") else {
+                continue;
+            };
+            path.push(field.name().clone());
+            match typed.data_type() {
+                DataType::Struct(nested) => self.collect_leaves(nested, path, leaves),
+                data_type => {
+                    if let Some(scalar) = Scalar::from_data_type(data_type) {
+                        let mut parts = vec![self.column, "typed_value"];
+                        for key in path.iter() {
+                            parts.push(key);
+                            parts.push("typed_value");
+                        }
+                        let count = self.present(&parts);
+                        leaves
+                            .entry(path.clone())
+                            .or_default()
+                            .push((scalar, count));
+                    }
+                }
+            }
+            path.pop();
+        }
+    }
+}
+
+/// Picks a seeded, stratified sample of one input and infers its Variant layout.
+///
+/// The caller counts the rows of every stratum first, then offers every row
+/// once with its stratum and its position in the input. Strata with fewer
+/// than the policy's minimum rows share one stratum. Each stratum keeps a row
+/// when a hash of the seed and the row's position falls below its Cochran
+/// sample size divided by its rows, so the same seed and positions always
+/// select the same rows. Only per-stratum counters are kept, never rows.
+pub struct VariantSampler {
+    /// Seed of the row-selection hash.
+    seed: u64,
+    /// Sampling stratum of each caller stratum.
+    stratum_of: Vec<usize>,
+    /// Probability of keeping a row, per sampling stratum.
+    rates: Vec<f64>,
+    /// Rows per sampling stratum.
+    rows: Vec<usize>,
+    /// Rows kept per sampling stratum.
+    kept: Vec<usize>,
+    /// Counters for every top-level Variant column.
+    analyzer: VariantLayoutAnalyzer,
+}
+
+impl VariantSampler {
+    /// Plans the sample of an input of `logical` rows whose caller strata hold `stratum_rows` rows.
+    pub fn new(
+        logical: &Schema,
+        policy: VariantShreddingPolicy,
+        seed: u64,
+        stratum_rows: &[usize],
+    ) -> Self {
+        let mut stratum_of = Vec::with_capacity(stratum_rows.len());
+        let mut rows = Vec::new();
+        let mut shared = None;
+        for &stratum in stratum_rows {
+            let index = if stratum >= policy.min_stratum_rows {
+                rows.push(0);
+                rows.len() - 1
+            } else {
+                *shared.get_or_insert_with(|| {
+                    rows.push(0);
+                    rows.len() - 1
+                })
+            };
+            rows[index] += stratum;
+            stratum_of.push(index);
+        }
+        let rates = rows
+            .iter()
+            .map(|&count| {
+                if count == 0 {
+                    0.0
+                } else {
+                    policy.stratum_sample_size(count) as f64 / count as f64
+                }
+            })
+            .collect();
+        let kept = vec![0; rows.len()];
+        Self {
+            seed,
+            stratum_of,
+            rates,
+            rows,
+            kept,
+            analyzer: VariantLayoutAnalyzer::new(logical, policy),
+        }
+    }
+
+    /// Whether the input has no Variant column, so nothing needs sampling.
     pub fn is_inert(&self) -> bool {
         self.analyzer.columns.is_empty()
     }
 
-    /// Rows retained so far.
-    pub fn retained_rows(&self) -> usize {
-        self.rows
+    /// Names of the Variant columns [`Self::offer`] reads; a caller projects only these.
+    pub fn column_names(&self) -> impl Iterator<Item = &str> {
+        self.analyzer
+            .columns
+            .iter()
+            .map(|sample| sample.name.as_str())
     }
 
-    /// Measured bytes retained so far.
-    pub fn retained_bytes(&self) -> usize {
-        self.bytes
-    }
-
-    /// Offers one batch.
+    /// Offers every row of `batch`; row `i` is in caller stratum `strata[i]` at position `first_position + i`.
     ///
-    /// Retains as many leading rows as the row bound allows unless doing so
-    /// would cross the byte bound with rows already retained. Returns
-    /// [`PrefixStep::Ready`] once either bound is reached; the retained rows
-    /// are then drained into the result and the prefix is empty.
+    /// `batch` needs only the Variant columns, found by name; other columns are ignored.
     ///
     /// # Errors
     ///
-    /// Returns an error when a Variant column cannot be read as Variant storage.
-    pub fn push(&mut self, batch: &RecordBatch) -> Result<PrefixStep> {
-        let take = batch
-            .num_rows()
-            .min(self.policy.max_rows.saturating_sub(self.rows));
-        let head = batch.slice(0, take);
-        let head_bytes = (self.measure)(&head);
-        if !self.retained.is_empty()
-            && self.bytes.saturating_add(head_bytes) > self.policy.max_bytes
-        {
-            return Ok(PrefixStep::Ready(self.drain(Some(batch.clone()))));
+    /// Returns an error when `strata` does not have one entry per row, names an
+    /// unknown stratum, a Variant column is missing from `batch`, or a Variant
+    /// column cannot be read as Variant storage.
+    pub fn offer(
+        &mut self,
+        batch: &RecordBatch,
+        strata: &[usize],
+        first_position: u64,
+    ) -> Result<()> {
+        if strata.len() != batch.num_rows() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Variant sample needs one stratum per row.",
+            ));
         }
-        self.analyzer.observe(&head)?;
-        self.retained.push(head);
-        self.rows += take;
-        self.bytes = self.bytes.saturating_add(head_bytes);
-        if take < batch.num_rows()
-            || self.rows >= self.policy.max_rows
-            || self.bytes >= self.policy.max_bytes
-        {
-            let remainder =
-                (take < batch.num_rows()).then(|| batch.slice(take, batch.num_rows() - take));
-            return Ok(PrefixStep::Ready(self.drain(remainder)));
+        let mut chosen = Vec::with_capacity(strata.len());
+        for (row, &stratum) in strata.iter().enumerate() {
+            let Some(&index) = self.stratum_of.get(stratum) else {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Variant sample has no stratum {stratum}."),
+                ));
+            };
+            if unit_hash(self.seed, first_position + row as u64) < self.rates[index] {
+                self.kept[index] += 1;
+                chosen.push((row, index));
+            }
         }
-        Ok(PrefixStep::Retained)
+        self.analyzer.observe(batch, &chosen)
     }
 
-    /// Infers from whatever was retained at close; `None` when nothing was.
-    pub fn finish(mut self) -> Option<ReadyPrefix> {
-        (!self.retained.is_empty()).then(|| self.drain(None))
-    }
-
-    /// Infers the layout and hands back the retained rows for replay.
-    fn drain(&mut self, remainder: Option<RecordBatch>) -> ReadyPrefix {
-        let layout = self.analyzer.layout();
-        self.rows = 0;
-        self.bytes = 0;
-        ReadyPrefix {
-            layout,
-            replay: std::mem::take(&mut self.retained),
-            remainder,
-        }
+    /// The layout the sample supports.
+    ///
+    /// A field is eligible when its sampled frequency among a stratum's
+    /// non-null roots is at least `min_frequency − margin` in any stratum.
+    /// Eligible fields are ranked by estimated rows covered, the sum over
+    /// strata of rows × sampled frequency, with ties broken by name.
+    pub fn layout(&self) -> VariantLayout {
+        let weights: Vec<f64> = self
+            .rows
+            .iter()
+            .zip(&self.kept)
+            .map(|(&rows, &kept)| {
+                if kept == 0 {
+                    0.0
+                } else {
+                    rows as f64 / kept as f64
+                }
+            })
+            .collect();
+        self.analyzer.layout(&weights)
     }
 }
 
-/// Sample statistics for every top-level Variant column of one file.
+/// A uniform value in `[0, 1)` from `seed` and `position`, stable across platforms and releases.
+///
+/// One SplitMix64 step: the seed advanced by `position` golden-ratio
+/// increments, then the standard finalizer.
+fn unit_hash(seed: u64, position: u64) -> f64 {
+    let mut z = seed.wrapping_add(position.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1_u64 << 53) as f64
+}
+
+/// What one stratum requires of a field and how much each of its sampled rows stands for.
+#[derive(Clone, Copy)]
+struct StratumRule {
+    /// Sampled roots holding a field for the field to be eligible in this stratum.
+    min_count: usize,
+    /// Input rows each sampled row of this stratum represents.
+    weight: f64,
+}
+
+/// Sample counters for every top-level Variant column of one input.
 struct VariantLayoutAnalyzer {
-    /// Bounds and thresholds for this file.
+    /// Parameters and caps.
     policy: VariantShreddingPolicy,
-    /// Column index and its root statistics.
-    columns: Vec<(usize, ColumnSample)>,
+    /// Counters per Variant column.
+    columns: Vec<ColumnSample>,
 }
 
-/// Statistics for one top-level Variant column.
-#[derive(Default)]
+/// Counters for one top-level Variant column.
 struct ColumnSample {
-    /// Non-null root values sampled.
-    roots: usize,
+    /// Index of the column in the logical schema.
+    index: usize,
+    /// Name the column is found by in offered batches.
+    name: String,
+    /// Sampled non-null roots per sampling stratum.
+    roots: BTreeMap<usize, usize>,
     /// Fields of root values that are objects.
     node: ObjectNode,
 }
@@ -293,52 +540,68 @@ struct ColumnSample {
 impl VariantLayoutAnalyzer {
     /// Finds the top-level Variant columns of `schema`.
     fn new(schema: &Schema, policy: VariantShreddingPolicy) -> Self {
-        let columns = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| field.extension_type_name() == Some(VariantType::NAME))
-            .map(|(index, _)| (index, ColumnSample::default()))
+        let columns = variant_columns(schema)
+            .map(|(index, field)| ColumnSample {
+                index,
+                name: field.name().clone(),
+                roots: BTreeMap::new(),
+                node: ObjectNode::default(),
+            })
             .collect();
         Self { policy, columns }
     }
 
-    /// Adds every non-null root value of `batch` to the sample.
-    fn observe(&mut self, batch: &RecordBatch) -> Result<()> {
-        for (index, sample) in &mut self.columns {
-            let variant =
-                VariantArray::try_new(batch.column(*index).as_ref()).map_err(variant_error)?;
-            for row in 0..variant.len() {
+    /// Adds the `chosen` rows of `batch`, each with its sampling stratum, to the counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a Variant column is missing from `batch` or is not Variant storage.
+    fn observe(&mut self, batch: &RecordBatch, chosen: &[(usize, usize)]) -> Result<()> {
+        for sample in &mut self.columns {
+            let column = batch.column_by_name(&sample.name).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Variant sample batch has no column {}.", sample.name),
+                )
+            })?;
+            let variant = VariantArray::try_new(column.as_ref()).map_err(variant_error)?;
+            for &(row, stratum) in chosen {
                 if variant.is_null(row) {
                     continue;
                 }
-                sample.roots += 1;
+                *sample.roots.entry(stratum).or_default() += 1;
                 if let Variant::Object(object) = variant.value(row) {
-                    sample.node.observe_object(&object, 1, &self.policy);
+                    sample
+                        .node
+                        .observe_object(&object, 1, stratum, &self.policy);
                 }
             }
         }
         Ok(())
     }
 
-    /// Chooses each column's shredding type from the sample.
-    fn layout(&self) -> VariantLayout {
+    /// Chooses each column's shredding type; `weights[h]` is the input rows per sampled row of stratum `h`.
+    fn layout(&self, weights: &[f64]) -> VariantLayout {
+        let fraction = (self.policy.min_frequency - self.policy.margin).max(0.0);
         let columns = self
             .columns
             .iter()
-            .filter_map(|(index, sample)| {
-                let min_count = (sample.roots * self.policy.min_frequency_percent).div_ceil(100);
-                let mut path = Vec::new();
-                let builder = sample.node.emit(
-                    ShreddedSchemaBuilder::new(),
-                    &mut path,
-                    min_count.max(1),
-                    &self.policy,
-                );
-                match builder.build() {
-                    DataType::Null => None,
-                    shredding_type => Some((*index, shredding_type)),
-                }
+            .filter_map(|sample| {
+                let rules: Vec<StratumRule> = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(stratum, &weight)| {
+                        let roots = sample.roots.get(&stratum).copied().unwrap_or(0);
+                        StratumRule {
+                            min_count: ((roots as f64) * fraction).ceil().max(1.0) as usize,
+                            weight,
+                        }
+                    })
+                    .collect();
+                sample
+                    .node
+                    .shredding_type(&rules, &self.policy)
+                    .map(|shredding_type| (sample.index, shredding_type))
             })
             .collect();
         VariantLayout { columns }
@@ -354,10 +617,41 @@ struct ObjectNode {
 
 /// How often one child appeared and which family its values share.
 struct Child {
-    /// Root values containing this child.
-    count: usize,
+    /// Roots holding this child, per stratum.
+    counts: BTreeMap<usize, usize>,
     /// Merged family of every non-null value seen.
     family: Family,
+}
+
+impl Child {
+    /// A child not yet seen with a value.
+    fn new() -> Self {
+        Child {
+            counts: BTreeMap::new(),
+            family: Family::Unknown,
+        }
+    }
+
+    /// Whether any stratum holds this child often enough under `rules`.
+    fn eligible(&self, rules: &[StratumRule]) -> bool {
+        self.counts.iter().any(|(&stratum, &count)| {
+            rules
+                .get(stratum)
+                .is_some_and(|rule| count >= rule.min_count)
+        })
+    }
+
+    /// Estimated input rows holding this child under `rules`.
+    fn covered(&self, rules: &[StratumRule]) -> f64 {
+        self.counts
+            .iter()
+            .map(|(&stratum, &count)| {
+                rules
+                    .get(stratum)
+                    .map_or(0.0, |rule| count as f64 * rule.weight)
+            })
+            .sum()
+    }
 }
 
 /// The shreddable type family of a path's values, merged across the sample.
@@ -397,62 +691,102 @@ enum Scalar {
 }
 
 impl ObjectNode {
-    /// Records the children of one object value at `depth`.
+    /// Records the children of one object value at `depth`, sampled in `stratum`.
     fn observe_object(
         &mut self,
         object: &parquet::variant::VariantObject<'_, '_>,
         depth: usize,
+        stratum: usize,
         policy: &VariantShreddingPolicy,
     ) {
         for (name, value) in object.iter() {
             let tracked = self.children.len();
             let child = match self.children.get_mut(name) {
                 Some(child) => child,
-                None if tracked < policy.max_tracked_children => {
-                    self.children.entry(name.to_owned()).or_insert(Child {
-                        count: 0,
-                        family: Family::Unknown,
-                    })
-                }
+                None if tracked < policy.max_tracked_children => self
+                    .children
+                    .entry(name.to_owned())
+                    .or_insert_with(Child::new),
                 None => continue,
             };
             if matches!(value, Variant::Null) {
                 continue;
             }
-            child.count += 1;
-            child.family.merge(&value, depth + 1, policy);
+            *child.counts.entry(stratum).or_default() += 1;
+            child.family.merge(&value, depth + 1, stratum, policy);
+        }
+    }
+
+    /// Records `count` rows holding the scalar leaf at `path` with type `scalar`.
+    ///
+    /// Used when counts come from footers rather than a sample: there is one
+    /// stratum, and each object on the path counts the most rows any of its
+    /// leaves holds, since an object is present wherever one of its leaves is.
+    fn insert_counted(&mut self, path: &[String], scalar: Scalar, count: usize) {
+        let Some((name, rest)) = path.split_first() else {
+            return;
+        };
+        let child = self.children.entry(name.clone()).or_insert_with(Child::new);
+        let counted = child.counts.entry(0).or_default();
+        *counted = (*counted).max(count);
+        if rest.is_empty() {
+            child.family = Family::Scalar(scalar);
+            return;
+        }
+        if !matches!(child.family, Family::Object(_)) {
+            child.family = Family::Object(ObjectNode::default());
+        }
+        if let Family::Object(node) = &mut child.family {
+            node.insert_counted(rest, scalar, count);
+        }
+    }
+
+    /// The shredding type of this root node under `rules`; `None` when nothing is kept.
+    fn shredding_type(
+        &self,
+        rules: &[StratumRule],
+        policy: &VariantShreddingPolicy,
+    ) -> Option<DataType> {
+        let mut path = Vec::new();
+        match self
+            .emit(ShreddedSchemaBuilder::new(), &mut path, rules, policy)
+            .build()
+        {
+            DataType::Null => None,
+            shredding_type => Some(shredding_type),
         }
     }
 
     /// Adds this node's kept children to `builder` under `path`.
     ///
-    /// Children seen in fewer than `min_count` root values or without one
-    /// compatible family are skipped; the remaining ones are capped by
-    /// frequency, ties broken by name, and emitted alphabetically.
+    /// Children not eligible in any stratum under `rules`, or without one
+    /// compatible family, are skipped; the remaining ones are capped by
+    /// estimated rows covered, ties broken by name, and emitted alphabetically.
     fn emit<'a>(
         &'a self,
         mut builder: ShreddedSchemaBuilder,
         path: &mut Vec<&'a str>,
-        min_count: usize,
+        rules: &[StratumRule],
         policy: &VariantShreddingPolicy,
     ) -> ShreddedSchemaBuilder {
-        let mut kept: Vec<(&'a String, &'a Child)> = self
+        let mut kept: Vec<(&'a String, &'a Child, f64)> = self
             .children
             .iter()
             .filter(|(_, child)| {
-                child.count >= min_count
+                child.eligible(rules)
                     && matches!(child.family, Family::Object(_) | Family::Scalar(_))
             })
+            .map(|(name, child)| (name, child, child.covered(rules)))
             .collect();
-        kept.sort_by(|(left_name, left), (right_name, right)| {
-            right.count.cmp(&left.count).then(left_name.cmp(right_name))
+        kept.sort_by(|(left_name, _, left), (right_name, _, right)| {
+            right.total_cmp(left).then(left_name.cmp(right_name))
         });
         kept.truncate(policy.max_emitted_children);
-        kept.sort_by_key(|(name, _)| *name);
-        for (name, child) in kept {
+        kept.sort_by_key(|(name, _, _)| *name);
+        for (name, child, _) in kept {
             path.push(name);
             builder = match &child.family {
-                Family::Object(node) => node.emit(builder, path, min_count, policy),
+                Family::Object(node) => node.emit(builder, path, rules, policy),
                 Family::Scalar(scalar) => {
                     let variant_path: VariantPath<'_> = path
                         .iter()
@@ -471,19 +805,25 @@ impl ObjectNode {
 }
 
 impl Family {
-    /// Merges one non-null value observed at `depth` into this family.
-    fn merge(&mut self, value: &Variant<'_, '_>, depth: usize, policy: &VariantShreddingPolicy) {
+    /// Merges one non-null value observed at `depth` in `stratum` into this family.
+    fn merge(
+        &mut self,
+        value: &Variant<'_, '_>,
+        depth: usize,
+        stratum: usize,
+        policy: &VariantShreddingPolicy,
+    ) {
         match (&mut *self, value) {
             (Family::Residual, _) => {}
             (_, Variant::List(_)) => *self = Family::Residual,
             (_, Variant::Object(_)) if depth > policy.max_depth => *self = Family::Residual,
             (Family::Unknown, Variant::Object(object)) => {
                 let mut node = ObjectNode::default();
-                node.observe_object(object, depth, policy);
+                node.observe_object(object, depth, stratum, policy);
                 *self = Family::Object(node);
             }
             (Family::Object(node), Variant::Object(object)) => {
-                node.observe_object(object, depth, policy)
+                node.observe_object(object, depth, stratum, policy)
             }
             (Family::Object(_), _) => *self = Family::Residual,
             (Family::Unknown, scalar) => {
@@ -535,6 +875,58 @@ impl Scalar {
             Variant::Uuid(_) => Scalar::Uuid,
             Variant::Null | Variant::Object(_) | Variant::List(_) => return None,
         })
+    }
+
+    /// The family a shredded leaf of `data_type` was written for; `None` for non-scalar types.
+    fn from_data_type(data_type: &DataType) -> Option<Self> {
+        Some(match data_type {
+            DataType::Boolean => Scalar::Boolean,
+            DataType::Int8 => Scalar::Int(1),
+            DataType::Int16 => Scalar::Int(2),
+            DataType::Int32 => Scalar::Int(4),
+            DataType::Int64 => Scalar::Int(8),
+            DataType::Decimal32(precision, scale)
+            | DataType::Decimal64(precision, scale)
+            | DataType::Decimal128(precision, scale) => {
+                let scale = u8::try_from(*scale).ok()?;
+                Scalar::decimal(*precision, scale)
+            }
+            DataType::Float32 => Scalar::Float,
+            DataType::Float64 => Scalar::Double,
+            DataType::Date32 => Scalar::Date,
+            DataType::Time64(TimeUnit::Microsecond) => Scalar::Time,
+            DataType::Timestamp(unit, zone) => Scalar::Timestamp {
+                nanos: *unit == TimeUnit::Nanosecond,
+                utc: zone.is_some(),
+            },
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Scalar::Binary,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Scalar::String,
+            DataType::FixedSizeBinary(16) => Scalar::Uuid,
+            _ => return None,
+        })
+    }
+
+    /// The type covering the most rows of one path across sources, with its rows.
+    ///
+    /// Types of one family widen together and add their rows; across families
+    /// the one with more rows wins, ties going to the first seen.
+    fn winner(typed: Vec<(Scalar, usize)>) -> Option<(Scalar, usize)> {
+        let mut families: Vec<(Scalar, usize)> = Vec::new();
+        for (scalar, count) in typed {
+            match families
+                .iter_mut()
+                .find_map(|(seen, rows)| seen.widen(scalar).map(|widened| (seen, rows, widened)))
+            {
+                Some((seen, rows, widened)) => {
+                    *seen = widened;
+                    *rows += count;
+                }
+                None => families.push((scalar, count)),
+            }
+        }
+        families
+            .into_iter()
+            .reduce(|best, next| if next.1 > best.1 { next } else { best })
     }
 
     /// A decimal of the given storage precision and scale.
@@ -615,23 +1007,23 @@ fn variant_error(err: arrow_schema::ArrowError) -> Error {
     Error::new(ErrorKind::DataInvalid, "Invalid Variant column.").with_source(err)
 }
 
-/// Builds Parquet writers that choose each file's Variant layout from that file's first rows.
+/// Builds Parquet writers that shred Variant columns with one layout chosen in advance.
 ///
-/// Every [`FileWriterBuilder::build`] starts a fresh [`VariantParquetWriter`]
-/// with an empty prefix, so each rolled output infers independently. The
-/// builder carries only the wrapped Parquet builder and the policy constants.
+/// Every file the builder opens uses the same layout, so all outputs of one
+/// rewrite share it. The builder carries only the wrapped Parquet builder and
+/// the layout.
 #[derive(Clone, Debug)]
 pub struct VariantParquetWriterBuilder {
-    /// Ordinary Parquet builder the deferred writer opens once the layout is known.
+    /// Ordinary Parquet builder each writer is opened from.
     inner: ParquetWriterBuilder,
-    /// Bounds and thresholds for every file.
-    policy: VariantShreddingPolicy,
+    /// Layout every file is shredded with.
+    layout: VariantLayout,
 }
 
 impl VariantParquetWriterBuilder {
-    /// Wraps `inner` so its files shred Variant columns under `policy`.
-    pub fn new(inner: ParquetWriterBuilder, policy: VariantShreddingPolicy) -> Self {
-        Self { inner, policy }
+    /// Wraps `inner` so its files shred Variant columns with `layout`.
+    pub fn new(inner: ParquetWriterBuilder, layout: VariantLayout) -> Self {
+        Self { inner, layout }
     }
 }
 
@@ -639,142 +1031,72 @@ impl FileWriterBuilder for VariantParquetWriterBuilder {
     type R = VariantParquetWriter;
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
-        let logical: SchemaRef = Arc::new(self.inner.schema().as_ref().try_into()?);
+        let builder = if self.layout.is_unshredded() {
+            self.inner.clone()
+        } else {
+            let logical: SchemaRef = Arc::new(self.inner.schema().as_ref().try_into()?);
+            self.inner
+                .clone()
+                .with_physical_schema(self.layout.physical_schema(&logical)?)?
+        };
         Ok(VariantParquetWriter {
-            prefix: Some((
-                VariantPrefix::new(&logical, self.policy, RecordBatch::get_array_memory_size),
-                output_file,
-            )),
-            builder: self.inner.clone(),
-            logical,
-            open: None,
+            writer: builder.build(output_file).await?,
+            layout: self.layout.clone(),
         })
     }
 }
 
-/// A Parquet writer that opens its encoder only after its Variant layout is inferred.
+/// A Parquet writer that shreds every batch with its layout before encoding it.
 ///
-/// Until a policy bound is reached the writer only retains rows; no file is
-/// created. It then opens an ordinary [`ParquetWriter`] with the shredded
-/// physical schema, replays the retained rows once, and streams the rest.
+/// The wrapped [`ParquetWriter`] opens its file on the first write, so an
+/// output that receives no rows creates no file.
 pub struct VariantParquetWriter {
-    /// Ordinary Parquet builder used to open the encoder.
-    builder: ParquetWriterBuilder,
-    /// Logical Arrow schema of the Iceberg table.
-    logical: SchemaRef,
-    /// Rows retained before the encoder opens, and the file they will go to.
-    prefix: Option<(VariantPrefix, OutputFile)>,
-    /// The open encoder and the layout every later batch is shredded with.
-    open: Option<(ParquetWriter, VariantLayout)>,
-}
-
-impl VariantParquetWriter {
-    /// Opens the encoder for `ready.layout` and writes the retained rows, then the remainder.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the physical schema is refused, the encoder cannot
-    /// be built, or a batch cannot be shredded or written.
-    async fn open(&mut self, ready: ReadyPrefix, output_file: OutputFile) -> Result<()> {
-        let ReadyPrefix {
-            layout,
-            replay,
-            remainder,
-        } = ready;
-        let builder = if layout.is_unshredded() {
-            self.builder.clone()
-        } else {
-            self.builder
-                .clone()
-                .with_physical_schema(layout.physical_schema(&self.logical)?)?
-        };
-        let mut writer = builder.build(output_file).await?;
-        for batch in replay.iter().chain(remainder.as_ref()) {
-            writer.write(&layout.shred(batch)?).await?;
-        }
-        self.open = Some((writer, layout));
-        Ok(())
-    }
+    /// Ordinary Parquet writer for the physical schema.
+    writer: ParquetWriter,
+    /// Layout every batch is shredded with.
+    layout: VariantLayout,
 }
 
 impl FileWriter for VariantParquetWriter {
     async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        if let Some((writer, layout)) = self.open.as_mut() {
-            return writer.write(&layout.shred(batch)?).await;
-        }
-        let Some((mut prefix, output_file)) = self.prefix.take() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Variant Parquet writer has neither a prefix nor an open encoder.",
-            ));
-        };
-        if prefix.is_inert() {
-            let ready = ReadyPrefix {
-                layout: VariantLayout::default(),
-                replay: Vec::new(),
-                remainder: Some(batch.clone()),
-            };
-            return self.open(ready, output_file).await;
-        }
-        match prefix.push(batch)? {
-            PrefixStep::Retained => {
-                self.prefix = Some((prefix, output_file));
-                Ok(())
-            }
-            PrefixStep::Ready(ready) => self.open(ready, output_file).await,
-        }
+        self.writer.write(&self.layout.shred(batch)?).await
     }
 
-    async fn close(mut self) -> Result<Vec<DataFileBuilder>> {
-        if let Some((prefix, output_file)) = self.prefix.take() {
-            match prefix.finish() {
-                Some(ready) => self.open(ready, output_file).await?,
-                None => return Ok(vec![]),
-            }
-        }
-        match self.open.take() {
-            Some((writer, _)) => writer.close().await,
-            None => Ok(vec![]),
-        }
+    async fn close(self) -> Result<Vec<DataFileBuilder>> {
+        self.writer.close().await
     }
 }
 
 impl CurrentFileStatus for VariantParquetWriter {
     fn current_file_path(&self) -> String {
-        match (&self.open, &self.prefix) {
-            (Some((writer, _)), _) => writer.current_file_path(),
-            (None, Some((_, output_file))) => output_file.location().to_string(),
-            (None, None) => String::new(),
-        }
+        self.writer.current_file_path()
     }
 
     fn current_row_num(&self) -> usize {
-        match (&self.open, &self.prefix) {
-            (Some((writer, _)), _) => writer.current_row_num(),
-            (None, Some((prefix, _))) => prefix.retained_rows(),
-            (None, None) => 0,
-        }
+        self.writer.current_row_num()
     }
 
     fn current_written_size(&self) -> usize {
-        self.open
-            .as_ref()
-            .map_or(0, |(writer, _)| writer.current_written_size())
+        self.writer.current_written_size()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use arrow_array::StringArray;
+    use bytes::Bytes;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::metadata::ParquetMetaDataReader;
     use parquet::variant::json_to_variant;
 
     use super::*;
 
-    /// The policy values Wyrd passes, with a row bound large enough to sample every test row.
+    /// The policy values Wyrd passes.
     const POLICY: VariantShreddingPolicy = VariantShreddingPolicy {
-        max_rows: 4_096,
-        max_bytes: 64 * 1024 * 1024,
-        min_frequency_percent: 10,
+        confidence_z: 2.5758,
+        margin: 0.02,
+        min_stratum_rows: 30,
+        min_frequency: 0.10,
         max_tracked_children: 1_000,
         max_emitted_children: 300,
         max_depth: 50,
@@ -788,13 +1110,31 @@ mod tests {
         RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant.into()]).unwrap()
     }
 
-    /// The shredding type inferred for column 0 from all of `json` under `policy`.
+    /// The layout sampled from `batch` with row `i` in stratum `strata[i]`.
+    fn sample(
+        batch: &RecordBatch,
+        strata: &[usize],
+        policy: VariantShreddingPolicy,
+        seed: u64,
+    ) -> VariantLayout {
+        let mut rows = Vec::new();
+        for &stratum in strata {
+            if rows.len() <= stratum {
+                rows.resize(stratum + 1, 0);
+            }
+            rows[stratum] += 1;
+        }
+        let mut sampler = VariantSampler::new(&batch.schema(), policy, seed, &rows);
+        sampler.offer(batch, strata, 0).unwrap();
+        sampler.layout()
+    }
+
+    /// The shredding type of column 0 sampled from all of `json`, as one stratum.
     fn infer_with(json: &[Option<&str>], policy: VariantShreddingPolicy) -> Option<DataType> {
         let batch = variant_batch(json);
-        let mut prefix =
-            VariantPrefix::new(&batch.schema(), policy, RecordBatch::get_array_memory_size);
-        assert!(matches!(prefix.push(&batch).unwrap(), PrefixStep::Retained));
-        prefix.finish().unwrap().layout.shredding_type(0).cloned()
+        sample(&batch, &vec![0; json.len()], policy, 7)
+            .shredding_type(0)
+            .cloned()
     }
 
     /// The `(name, typed_value type)` pairs of an object shredding type, in emitted order.
@@ -808,16 +1148,53 @@ mod tests {
             .collect()
     }
 
+    /// The field names shredded in `shredding_type`, in emitted order.
+    fn names(shredding_type: Option<&DataType>) -> Vec<String> {
+        shredded_fields(shredding_type.cloned())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// The fields inferred from `json` under the default policy.
     fn infer(json: &[Option<&str>]) -> Vec<(String, DataType)> {
         shredded_fields(infer_with(json, POLICY))
     }
 
-    /// A field present in at least 10% of non-null roots is shredded; one below is not; nulls do not count.
+    /// The footer of an in-memory Parquet file holding `batch` shredded as sampled from itself.
+    fn shredded_footer(batch: &RecordBatch) -> Arc<ParquetMetaData> {
+        let layout = sample(batch, &vec![0; batch.num_rows()], POLICY, 7);
+        let physical = layout.shred(batch).unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, physical.schema(), None).unwrap();
+        writer.write(&physical).unwrap();
+        writer.close().unwrap();
+        Arc::new(
+            ParquetMetaDataReader::new()
+                .parse_and_finish(&Bytes::from(bytes))
+                .unwrap(),
+        )
+    }
+
+    /// Cochran's size is 4147 for a large stratum at 99% / ±0.02, shrinks with the
+    /// finite-population correction, and is zero for an empty stratum or the default policy.
+    #[test]
+    fn stratum_sample_size_follows_cochran() {
+        assert_eq!(POLICY.stratum_sample_size(1_000_000_000), 4147);
+        assert_eq!(POLICY.stratum_sample_size(100), 98);
+        assert_eq!(POLICY.stratum_sample_size(10), 10);
+        assert_eq!(POLICY.stratum_sample_size(0), 0);
+        assert_eq!(
+            VariantShreddingPolicy::default().stratum_sample_size(1_000),
+            0
+        );
+    }
+
+    /// A field is eligible at 8% (10% minus the margin) of sampled non-null roots; nulls do not count.
     #[test]
     fn frequency_boundary_ignores_nulls() {
         let mut rows = vec![Some(r#"{"a":1}"#)];
-        rows.extend(std::iter::repeat_n(Some(r#"{"b":1}"#), 9));
+        rows.extend(std::iter::repeat_n(Some(r#"{"b":1}"#), 11));
         rows.extend(std::iter::repeat_n(None, 5));
         assert_eq!(infer(&rows), [
             ("a".to_string(), DataType::Int8),
@@ -825,6 +1202,102 @@ mod tests {
         ]);
         rows.push(Some(r#"{"b":2}"#));
         assert_eq!(infer(&rows), [("b".to_string(), DataType::Int8)]);
+    }
+
+    /// A field common in one writer's rows but rare overall is shredded, whether
+    /// that writer has its own stratum or shares the merged small-writer stratum.
+    #[test]
+    fn small_writers_keep_their_fields() {
+        let mut json = vec![Some(r#"{"rare":1}"#); 4];
+        json.extend(std::iter::repeat_n(Some(r#"{"x":1}"#), 36));
+        json.extend(std::iter::repeat_n(Some(r#"{"common":1}"#), 60));
+        let mut strata = vec![0; 40];
+        strata.extend(std::iter::repeat_n(1, 60));
+        let batch = variant_batch(&json);
+        let own = sample(&batch, &strata, POLICY, 7);
+        assert!(names(own.shredding_type(0)).contains(&"rare".to_string()));
+        let one = sample(&batch, &vec![0; 100], POLICY, 7);
+        assert!(
+            !names(one.shredding_type(0)).contains(&"rare".to_string()),
+            "4 of 100 rows is below 8% without strata"
+        );
+
+        let mut json = vec![Some(r#"{"tiny":1}"#); 5];
+        json.extend(std::iter::repeat_n(Some(r#"{"x":1}"#), 20));
+        json.extend(std::iter::repeat_n(Some(r#"{"common":1}"#), 75));
+        let mut strata = vec![0; 5];
+        strata.extend(std::iter::repeat_n(1, 20));
+        strata.extend(std::iter::repeat_n(2, 75));
+        let merged = sample(&variant_batch(&json), &strata, POLICY, 7);
+        assert!(
+            names(merged.shredding_type(0)).contains(&"tiny".to_string()),
+            "5 of the 25 rows in the merged small-writer stratum"
+        );
+    }
+
+    /// The same seed and positions select the same rows and layout; the rate
+    /// matches Cochran's size over the stratum's rows.
+    #[test]
+    fn sampling_is_seeded_and_reproducible() {
+        let rows = 20_000;
+        let schema = variant_batch(&[None]).schema();
+        let run = |seed: u64| {
+            let mut sampler = VariantSampler::new(&schema, POLICY, seed, &[rows]);
+            let documents: Vec<Option<String>> = (0..rows)
+                .map(|row| Some(format!(r#"{{"k{}":1}}"#, row % 7)))
+                .collect();
+            let json: Vec<Option<&str>> = documents.iter().map(Option::as_deref).collect();
+            for (chunk, start) in json.chunks(4_096).zip((0..).step_by(4_096)) {
+                let batch = variant_batch(chunk);
+                sampler.offer(&batch, &vec![0; chunk.len()], start).unwrap();
+            }
+            (sampler.kept[0], sampler.layout())
+        };
+        let (kept, layout) = run(42);
+        assert_eq!(run(42), (kept, layout.clone()));
+        let expected = POLICY.stratum_sample_size(rows);
+        assert!(
+            kept.abs_diff(expected) < expected / 10,
+            "kept {kept}, expected about {expected}"
+        );
+        assert_eq!(names(layout.shredding_type(0)).len(), 7);
+    }
+
+    /// At the cap, children are kept by estimated rows covered, not raw sampled counts.
+    #[test]
+    fn cap_ranks_by_rows_covered() {
+        let policy = VariantShreddingPolicy {
+            max_emitted_children: 2,
+            ..POLICY
+        };
+        let mut node = ObjectNode::default();
+        let observe = |node: &mut ObjectNode, json: &str, stratum: usize| {
+            let batch = variant_batch(&[Some(json)]);
+            let variant = VariantArray::try_new(batch.column(0).as_ref()).unwrap();
+            if let Variant::Object(object) = variant.value(0) {
+                node.observe_object(&object, 1, stratum, &policy);
+            }
+        };
+        observe(&mut node, r#"{"x":1}"#, 0);
+        for _ in 0..5 {
+            observe(&mut node, r#"{"y":1}"#, 1);
+        }
+        for _ in 0..3 {
+            observe(&mut node, r#"{"z":1}"#, 1);
+        }
+        let rules = [
+            StratumRule {
+                min_count: 1,
+                weight: 100.0,
+            },
+            StratumRule {
+                min_count: 1,
+                weight: 1.0,
+            },
+        ];
+        assert_eq!(names(node.shredding_type(&rules, &policy).as_ref()), [
+            "x", "y"
+        ]);
     }
 
     /// Integers and decimals widen within their family; mixed families, containers, and arrays stay residual.
@@ -858,16 +1331,17 @@ mod tests {
             variant.into(),
         ])
         .unwrap();
-        let mut prefix =
-            VariantPrefix::new(&batch.schema(), POLICY, RecordBatch::get_array_memory_size);
-        prefix.push(&batch).unwrap();
         assert_eq!(
-            shredded_fields(prefix.finish().unwrap().layout.shredding_type(0).cloned()),
+            shredded_fields(
+                sample(&batch, &[0, 0], POLICY, 7)
+                    .shredding_type(0)
+                    .cloned()
+            ),
             [("d".to_string(), DataType::Decimal64(18, 3))]
         );
     }
 
-    /// Children are kept by frequency with ties broken by name, emitted alphabetically, and capped.
+    /// Children are kept by count with ties broken by name, emitted alphabetically, and capped.
     #[test]
     fn children_are_capped_by_frequency_then_name() {
         let policy = VariantShreddingPolicy {
@@ -920,109 +1394,16 @@ mod tests {
         );
     }
 
-    /// The row bound is reached mid-batch: the head is retained and the rest is the remainder.
-    #[test]
-    fn row_bound_splits_the_batch() {
-        let policy = VariantShreddingPolicy {
-            max_rows: 2,
-            ..POLICY
-        };
-        let batch = variant_batch(&[Some(r#"{"a":1}"#), Some(r#"{"a":2}"#), Some(r#"{"b":"x"}"#)]);
-        let mut prefix =
-            VariantPrefix::new(&batch.schema(), policy, RecordBatch::get_array_memory_size);
-        let PrefixStep::Ready(ready) = prefix.push(&batch).unwrap() else {
-            panic!("the row bound is reached");
-        };
-        assert_eq!(
-            ready
-                .replay
-                .iter()
-                .map(RecordBatch::num_rows)
-                .sum::<usize>(),
-            2
-        );
-        assert_eq!(ready.remainder.map(|rest| rest.num_rows()), Some(1));
-        assert_eq!(shredded_fields(ready.layout.shredding_type(0).cloned()), [
-            ("a".to_string(), DataType::Int8)
-        ]);
-    }
-
-    /// The byte bound stops before a batch that would cross it; that batch is not sampled.
-    #[test]
-    fn byte_bound_stops_before_crossing() {
-        let first = variant_batch(&[Some(r#"{"a":1}"#)]);
-        let policy = VariantShreddingPolicy {
-            max_bytes: first.get_array_memory_size() + 1,
-            ..POLICY
-        };
-        let mut prefix =
-            VariantPrefix::new(&first.schema(), policy, RecordBatch::get_array_memory_size);
-        assert!(matches!(prefix.push(&first).unwrap(), PrefixStep::Retained));
-        let second = variant_batch(&[Some(r#"{"b":"x"}"#)]);
-        let PrefixStep::Ready(ready) = prefix.push(&second).unwrap() else {
-            panic!("the second batch would cross the byte bound");
-        };
-        assert_eq!(ready.replay.len(), 1);
-        assert_eq!(ready.remainder.map(|rest| rest.num_rows()), Some(1));
-        assert_eq!(shredded_fields(ready.layout.shredding_type(0).cloned()), [
-            ("a".to_string(), DataType::Int8)
-        ]);
-    }
-
-    /// A first batch alone over the byte bound is retained and sampled as the progress exception.
-    #[test]
-    fn oversized_first_batch_is_retained() {
-        let policy = VariantShreddingPolicy {
-            max_bytes: 1,
-            ..POLICY
-        };
-        let batch = variant_batch(&[Some(r#"{"a":1}"#)]);
-        let mut prefix =
-            VariantPrefix::new(&batch.schema(), policy, RecordBatch::get_array_memory_size);
-        let PrefixStep::Ready(ready) = prefix.push(&batch).unwrap() else {
-            panic!("an oversized first batch is ready at once");
-        };
-        assert_eq!(ready.replay.len(), 1);
-        assert!(ready.remainder.is_none());
-        assert!(!ready.layout.is_unshredded());
-    }
-
-    /// Close infers from a short prefix, and an empty prefix yields nothing to write.
-    #[test]
-    fn short_close_infers_and_empty_close_writes_nothing() {
-        let batch = variant_batch(&[Some(r#"{"a":1}"#)]);
-        let empty = VariantPrefix::new(&batch.schema(), POLICY, RecordBatch::get_array_memory_size);
-        assert!(empty.finish().is_none());
-        assert_eq!(infer(&[Some(r#"{"a":1}"#)]), [(
-            "a".to_string(),
-            DataType::Int8
-        )]);
-    }
-
     /// The default policy samples nothing, so it writes unshredded files.
     #[test]
     fn default_policy_never_shreds() {
-        let batch = variant_batch(&[Some(r#"{"a":1}"#)]);
-        let mut prefix = VariantPrefix::new(
-            &batch.schema(),
-            VariantShreddingPolicy::default(),
-            RecordBatch::get_array_memory_size,
-        );
-        let PrefixStep::Ready(ready) = prefix.push(&batch).unwrap() else {
-            panic!("a zero row bound is reached at once");
-        };
-        assert!(ready.layout.is_unshredded());
-        assert_eq!(ready.remainder.map(|rest| rest.num_rows()), Some(1));
+        assert!(infer_with(&[Some(r#"{"a":1}"#)], VariantShreddingPolicy::default()).is_none());
     }
 
     /// Shredding keeps logical values: a later value that does not fit the type goes to the residual.
     #[test]
     fn later_incompatible_values_round_trip() {
-        let sample = variant_batch(&[Some(r#"{"a":1}"#)]);
-        let mut prefix =
-            VariantPrefix::new(&sample.schema(), POLICY, RecordBatch::get_array_memory_size);
-        prefix.push(&sample).unwrap();
-        let layout = prefix.finish().unwrap().layout;
+        let layout = sample(&variant_batch(&[Some(r#"{"a":1}"#)]), &[0], POLICY, 7);
         let later = variant_batch(&[Some(r#"{"a":"text"}"#), Some(r#"{"a":[1,2]}"#), None]);
         let shredded = layout.shred(&later).unwrap();
         let logical: ArrayRef = parquet::variant::unshred_variant(
@@ -1036,5 +1417,48 @@ mod tests {
             Some(r#"{"a":[1,2]}"#),
             None
         ]);
+    }
+
+    /// Footer counts combine across sources: same-family types widen, a field
+    /// below 10% of the combined roots is dropped, and nested leaves survive.
+    #[test]
+    fn combine_counts_footer_leaves() {
+        let mut first = vec![Some(r#"{"a":1,"o":{"x":"p"}}"#); 9];
+        first.push(Some(r#"{"a":2,"o":{"x":"q"},"b":"rare"}"#));
+        let second = vec![Some(r#"{"a":70000,"c":"s"}"#); 10];
+        let footers = [
+            shredded_footer(&variant_batch(&first)),
+            shredded_footer(&variant_batch(&second)),
+        ];
+        let schema = variant_batch(&[None]).schema();
+        let layout = VariantLayout::combine(&schema, &footers, &POLICY).unwrap();
+        let fields = shredded_fields(layout.shredding_type(0).cloned());
+        let by_name: BTreeMap<_, _> = fields.into_iter().collect();
+        assert_eq!(
+            by_name.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["a", "c", "o"],
+            "b is 1 of 20 roots"
+        );
+        assert_eq!(by_name["a"], DataType::Int32);
+    }
+
+    /// Across type families the type covering more rows wins; no footers means no shredding.
+    #[test]
+    fn combine_keeps_the_type_covering_more_rows() {
+        let footers = [
+            shredded_footer(&variant_batch(&[Some(r#"{"x":1}"#); 5])),
+            shredded_footer(&variant_batch(&[Some(r#"{"x":"s"}"#); 8])),
+        ];
+        let schema = variant_batch(&[None]).schema();
+        let layout = VariantLayout::combine(&schema, &footers, &POLICY).unwrap();
+        assert_eq!(shredded_fields(layout.shredding_type(0).cloned()), [(
+            "x".to_string(),
+            DataType::Utf8
+        )]);
+        assert!(
+            VariantLayout::combine(&schema, &[], &POLICY)
+                .unwrap()
+                .is_unshredded()
+        );
     }
 }

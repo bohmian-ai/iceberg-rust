@@ -1086,8 +1086,8 @@ message schema {
 
     /// A shredded file reads back as the logical Variant values, residuals included.
     ///
-    /// The file shreds `a` (an object with `x` and `y`) and `c` from a prefix,
-    /// then holds rows whose values do not fit that layout: a string `x`, a
+    /// The file shreds `a` (an object with `x` and `y`) and `c`, sampled from
+    /// its first two rows, then holds rows whose values do not fit that layout: a string `x`, a
     /// scalar `a`, an array, a missing field, and a null row. The reader must
     /// return the logical `metadata`/`value` storage with every value unchanged.
     #[tokio::test]
@@ -1095,7 +1095,7 @@ message schema {
         use parquet::variant::{json_to_variant, variant_to_json};
 
         use crate::writer::file_writer::variant_shredding::{
-            PrefixStep, VariantPrefix, VariantShreddingPolicy,
+            VariantSampler, VariantShreddingPolicy,
         };
 
         let json = [
@@ -1116,24 +1116,23 @@ message schema {
             ArrayRef::from(variant),
         ])
         .unwrap();
-        let prefix_rows = logical.slice(0, 2);
-        let mut prefix = VariantPrefix::new(
-            &prefix_rows.schema(),
+        let sampled_rows = logical.slice(0, 2);
+        let mut sampler = VariantSampler::new(
+            &sampled_rows.schema(),
             VariantShreddingPolicy {
-                max_rows: 4_096,
-                max_bytes: usize::MAX,
-                min_frequency_percent: 10,
+                confidence_z: 2.5758,
+                margin: 0.02,
+                min_stratum_rows: 30,
+                min_frequency: 0.10,
                 max_tracked_children: 1_000,
                 max_emitted_children: 300,
                 max_depth: 50,
             },
-            RecordBatch::get_array_memory_size,
+            7,
+            &[2],
         );
-        assert!(matches!(
-            prefix.push(&prefix_rows).unwrap(),
-            PrefixStep::Retained
-        ));
-        let layout = prefix.finish().unwrap().layout;
+        sampler.offer(&sampled_rows, &[0, 0], 0).unwrap();
+        let layout = sampler.layout();
         let physical = layout.shred(&logical).unwrap();
         assert!(
             matches!(physical.schema().field(0).data_type(), DataType::Struct(children)
