@@ -29,22 +29,25 @@
 //! Both perform no IO; callers keep their own. Arrow owns the standard
 //! encoding: the layout is built with [`ShreddedSchemaBuilder`] and applied
 //! with [`shred_variant`]. This module only decides which object fields to
-//! shred and as which type. Only top-level Variant columns are shredded;
-//! arrays always stay in the residual `value`.
+//! shred and as which type. Every Variant field is shredded, at any Struct or
+//! List depth, addressed by its name path
+//! ([`variant_field_paths`](crate::arrow::variant_field_paths)); arrays
+//! inside a Variant value always stay in the residual `value`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
-use arrow_schema::extension::ExtensionType;
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::variant::{
-    ShreddedSchemaBuilder, Variant, VariantArray, VariantPath, VariantPathElement, VariantType,
-    shred_variant,
+    ShreddedSchemaBuilder, Variant, VariantArray, VariantPath, VariantPathElement, shred_variant,
 };
 
 use super::{FileWriter, FileWriterBuilder, ParquetWriter, ParquetWriterBuilder};
+use crate::arrow::{map_variant_field, variant_field_paths};
 use crate::io::OutputFile;
 use crate::spec::DataFileBuilder;
 use crate::writer::CurrentFileStatus;
@@ -94,26 +97,32 @@ impl VariantShreddingPolicy {
     }
 }
 
-/// One physical Variant layout per top-level Variant column of a file.
+/// One physical Variant layout per Variant field of a file, at any Struct
+/// or List depth.
 ///
-/// An empty layout leaves every column unshredded.
+/// An empty layout leaves every field unshredded.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VariantLayout {
-    /// Column index and the shredding type passed to [`shred_variant`].
-    columns: Vec<(usize, DataType)>,
+    /// Name path of each shredded Variant field and the shredding type passed
+    /// to [`shred_variant`].
+    fields: Vec<(Vec<String>, DataType)>,
 }
 
 impl VariantLayout {
-    /// Whether no column is shredded.
+    /// Whether no field is shredded.
     pub fn is_unshredded(&self) -> bool {
-        self.columns.is_empty()
+        self.fields.is_empty()
     }
 
-    /// The shredding type chosen for column `index`, if it is shredded.
-    pub fn shredding_type(&self, index: usize) -> Option<&DataType> {
-        self.columns
-            .iter()
-            .find_map(|(column, data_type)| (*column == index).then_some(data_type))
+    /// The shredding type chosen for the Variant field at name `path`, if it is shredded.
+    pub fn shredding_type(&self, path: &[&str]) -> Option<&DataType> {
+        self.fields.iter().find_map(|(field, data_type)| {
+            field
+                .iter()
+                .map(String::as_str)
+                .eq(path.iter().copied())
+                .then_some(data_type)
+        })
     }
 
     /// The shredded physical schema of `logical` under this layout.
@@ -130,37 +139,35 @@ impl VariantLayout {
             .schema())
     }
 
-    /// Shreds every Variant column this layout names and returns the physical batch.
+    /// Shreds every Variant field this layout names and returns the physical batch.
     ///
     /// Each shredded field keeps its name, nullability, and metadata (field id
     /// and Variant extension); only its storage type becomes the standard
-    /// `metadata`/`value`/`typed_value` struct. Values that do not fit the
-    /// chosen type are kept in the residual `value`, so the logical values are
+    /// `metadata`/`value`/`typed_value` struct, and the Structs and Lists
+    /// around it are rebuilt with that type. Values that do not fit the chosen
+    /// type are kept in the residual `value`, so the logical values are
     /// unchanged.
     ///
     /// # Errors
     ///
-    /// Returns an error when a named column is not valid Variant storage or
-    /// Arrow refuses to shred it.
+    /// Returns an error when a named field is missing, is not valid Variant
+    /// storage, or Arrow refuses to shred it.
     pub fn shred(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if self.is_unshredded() {
             return Ok(batch.clone());
         }
         let schema = batch.schema();
-        let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+        let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-        for (index, shredding_type) in &self.columns {
-            let variant = VariantArray::try_new(columns[*index].as_ref()).map_err(variant_error)?;
-            let shredded: ArrayRef = shred_variant(&variant, shredding_type)
-                .map_err(variant_error)?
-                .into();
-            fields[*index] = Arc::new(
-                fields[*index]
-                    .as_ref()
-                    .clone()
-                    .with_data_type(shredded.data_type().clone()),
-            );
-            columns[*index] = shredded;
+        for (path, shredding_type) in &self.fields {
+            let index = schema.index_of(&path[0])?;
+            (fields[index], columns[index]) =
+                map_variant_field(&fields[index], &columns[index], path, &mut |variant| {
+                    let variant = VariantArray::try_new(variant.as_ref()).map_err(variant_error)?;
+                    Ok(shred_variant(&variant, shredding_type)
+                        .map_err(variant_error)?
+                        .into())
+                })?;
         }
         let physical = Schema::new(fields).with_metadata(schema.metadata().clone());
         RecordBatch::try_new(Arc::new(physical), columns).map_err(|err| {
@@ -170,9 +177,10 @@ impl VariantLayout {
 
     /// Combines the layouts `footers` already chose into one layout for files of `logical`.
     ///
-    /// For each top-level Variant column, every source's shredded scalar leaf
-    /// counts its rows minus its null count: the exact rows holding that field
-    /// with that type. A leaf whose footer has no null count counts every row.
+    /// For each Variant field, at any Struct or List depth, every source's
+    /// shredded scalar leaf counts its values minus its null count: the exact
+    /// values holding that field with that type (inside a List, each element
+    /// counts). A leaf whose footer has no null count counts every value.
     /// Counts are summed over all sources; types of one family widen together,
     /// and across families the type covering more rows wins (the others go to
     /// the residual). A field is kept when its combined count reaches
@@ -189,18 +197,18 @@ impl VariantLayout {
         footers: &[Arc<ParquetMetaData>],
         policy: &VariantShreddingPolicy,
     ) -> Result<Self> {
-        let mut columns = Vec::new();
-        for (index, field) in variant_columns(logical) {
+        let mut fields = Vec::new();
+        for field in variant_field_paths(logical.fields()) {
             let mut roots = 0_usize;
             let mut leaves: BTreeMap<Vec<String>, Vec<(Scalar, usize)>> = BTreeMap::new();
             for footer in footers {
-                let counts = FooterCounts::new(footer, field.name())?;
-                roots += counts.present(&[field.name().as_str(), "metadata"]);
-                let Some(typed) = counts.typed_value_fields() else {
+                let counts = FooterCounts::new(footer, &field)?;
+                roots += counts.metadata_values();
+                let Some((first_leaf, typed)) = counts.typed_value_fields() else {
                     continue;
                 };
                 let mut path = Vec::new();
-                counts.collect_leaves(&typed, &mut path, &mut leaves);
+                counts.collect_leaves(&typed, first_leaf, &mut path, &mut leaves);
             }
             let mut root = ObjectNode::default();
             for (path, typed) in leaves {
@@ -214,54 +222,104 @@ impl VariantLayout {
                 weight: 1.0,
             }];
             if let Some(shredding_type) = root.shredding_type(&rules, policy) {
-                columns.push((index, shredding_type));
+                fields.push((field, shredding_type));
             }
         }
-        Ok(VariantLayout { columns })
+        Ok(VariantLayout { fields })
     }
 }
 
-/// The top-level Variant columns of `schema`, with their indices.
-fn variant_columns(schema: &Schema) -> impl Iterator<Item = (usize, &Arc<Field>)> {
-    schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, field)| field.extension_type_name() == Some(VariantType::NAME))
+/// The Parquet leaf indices of one Variant field in a file footer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantLeaves {
+    /// Every leaf the field is stored in.
+    pub all: Range<usize>,
+    /// The `metadata` leaf.
+    pub metadata: Option<usize>,
+    /// The root residual `value` leaf, when the file stores one.
+    pub value: Option<usize>,
 }
 
-/// Shredded-leaf counts of one Variant column in one source footer.
+/// Locates every Variant field of `logical`, at any Struct or List depth, in
+/// `footer`, through the same path walk the footer combine uses. A field the
+/// file lacks is skipped.
+///
+/// # Errors
+///
+/// Returns an error when the footer's schema cannot be read as Arrow.
+pub fn variant_leaves(logical: &Schema, footer: &ParquetMetaData) -> Result<Vec<VariantLeaves>> {
+    let mut found = Vec::new();
+    for path in variant_field_paths(logical.fields()) {
+        let counts = FooterCounts::new(footer, &path)?;
+        let Some((DataType::Struct(storage), first_leaf)) = &counts.storage else {
+            continue;
+        };
+        let leaves = storage
+            .iter()
+            .map(|child| leaf_count(child.data_type()))
+            .sum::<usize>();
+        let leaf = |name| child_leaf(storage, *first_leaf, name).map(|(leaf, _)| leaf);
+        found.push(VariantLeaves {
+            all: *first_leaf..first_leaf + leaves,
+            metadata: leaf("metadata"),
+            value: leaf("value"),
+        });
+    }
+    Ok(found)
+}
+
+/// Number of Parquet leaf columns a field of `data_type` is stored in.
+fn leaf_count(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Struct(children) => children
+            .iter()
+            .map(|child| leaf_count(child.data_type()))
+            .sum(),
+        DataType::List(element)
+        | DataType::LargeList(element)
+        | DataType::FixedSizeList(element, _)
+        | DataType::Map(element, _) => leaf_count(element.data_type()),
+        _ => 1,
+    }
+}
+
+/// The child named `name` of `fields`, whose leaves start at `first_leaf`,
+/// with the index of the child's own first leaf.
+fn child_leaf<'f>(
+    fields: &'f Fields,
+    first_leaf: usize,
+    name: &str,
+) -> Option<(usize, &'f FieldRef)> {
+    let mut leaf = first_leaf;
+    for field in fields {
+        if field.name() == name {
+            return Some((leaf, field));
+        }
+        leaf += leaf_count(field.data_type());
+    }
+    None
+}
+
+/// Shredded-leaf counts of one Variant field in one source footer.
+///
+/// Parquet leaves are numbered in schema order, so a leaf's index is found by
+/// counting the leaves of the fields before it.
 struct FooterCounts<'a> {
     /// The source file's metadata.
     footer: &'a ParquetMetaData,
-    /// Name of the Variant column.
-    column: &'a str,
-    /// Leaf column index by its full dotted path parts.
-    leaves: HashMap<Vec<&'a str>, usize>,
-    /// The column's Arrow storage type in this file.
-    storage: Option<DataType>,
+    /// The field's Arrow storage type in this file and its first leaf index,
+    /// or `None` when the file lacks the field.
+    storage: Option<(DataType, usize)>,
 }
 
 impl<'a> FooterCounts<'a> {
-    /// Indexes the leaves of `column` in `footer`.
+    /// Finds the Variant field at name `path` in `footer`.
     ///
     /// # Errors
     ///
     /// Returns an error when the footer's schema cannot be read as Arrow.
-    fn new(footer: &'a ParquetMetaData, column: &'a str) -> Result<Self> {
+    fn new(footer: &'a ParquetMetaData, path: &[String]) -> Result<Self> {
         let descr = footer.file_metadata().schema_descr();
-        let leaves = descr
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, leaf)| leaf.path().parts().first().map(String::as_str) == Some(column))
-            .map(|(index, leaf)| {
-                (
-                    leaf.path().parts().iter().map(String::as_str).collect(),
-                    index,
-                )
-            })
-            .collect();
         let arrow = parquet::arrow::parquet_to_arrow_schema(descr, None).map_err(|err| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -269,52 +327,80 @@ impl<'a> FooterCounts<'a> {
             )
             .with_source(err)
         })?;
-        let storage = arrow
-            .field_with_name(column)
-            .ok()
-            .map(|field| field.data_type().clone());
         Ok(Self {
             footer,
-            column,
-            leaves,
-            storage,
+            storage: Self::locate(arrow.fields(), 0, path),
         })
     }
 
-    /// Rows whose leaf at `path` is not null, summed over row groups.
-    ///
-    /// A row group without a null count counts every row; a missing leaf counts none.
-    fn present(&self, path: &[&str]) -> usize {
-        let Some(&leaf) = self.leaves.get(path) else {
-            return 0;
-        };
-        self.footer
-            .row_groups()
-            .iter()
-            .map(|group| {
-                let rows = usize::try_from(group.num_rows()).unwrap_or(0);
-                let nulls = group
-                    .column(leaf)
-                    .statistics()
-                    .and_then(|stats| stats.null_count_opt())
-                    .map_or(0, |nulls| usize::try_from(nulls).unwrap_or(rows));
-                rows.saturating_sub(nulls)
-            })
-            .sum()
+    /// The type and first leaf index of the field at `path` among `fields`,
+    /// whose leaves start at `first_leaf`.
+    fn locate(fields: &Fields, first_leaf: usize, path: &[String]) -> Option<(DataType, usize)> {
+        let (name, rest) = path.split_first()?;
+        let (leaf, field) = child_leaf(fields, first_leaf, name)?;
+        Self::descend(field.data_type(), leaf, rest)
     }
 
-    /// The fields of the column's top-level `typed_value` object, if it is shredded as one.
-    fn typed_value_fields(&self) -> Option<Fields> {
-        let DataType::Struct(storage) = self.storage.as_ref()? else {
-            return None;
+    /// The type and first leaf index at the rest of a path below a field of
+    /// `data_type` whose leaves start at `first_leaf`; a List step enters the
+    /// element, a Struct step names a child.
+    fn descend(
+        data_type: &DataType,
+        first_leaf: usize,
+        rest: &[String],
+    ) -> Option<(DataType, usize)> {
+        let Some((_, tail)) = rest.split_first() else {
+            return Some((data_type.clone(), first_leaf));
         };
-        match storage.find("typed_value")?.1.data_type() {
-            DataType::Struct(fields) => Some(fields.clone()),
+        match data_type {
+            DataType::List(element) => Self::descend(element.data_type(), first_leaf, tail),
+            DataType::Struct(children) => Self::locate(children, first_leaf, rest),
             _ => None,
         }
     }
 
-    /// Adds every shredded scalar leaf under `fields` at `path` to `leaves`.
+    /// Non-null values of leaf `leaf`, summed over row groups.
+    ///
+    /// A row group without a null count counts every value.
+    fn present(&self, leaf: usize) -> usize {
+        self.footer
+            .row_groups()
+            .iter()
+            .map(|group| {
+                let column = group.column(leaf);
+                let values = usize::try_from(column.num_values()).unwrap_or(0);
+                let nulls = column
+                    .statistics()
+                    .and_then(|stats| stats.null_count_opt())
+                    .map_or(0, |nulls| usize::try_from(nulls).unwrap_or(values));
+                values.saturating_sub(nulls)
+            })
+            .sum()
+    }
+
+    /// Non-null Variant values of the field: its non-null `metadata` leaf.
+    fn metadata_values(&self) -> usize {
+        let Some((DataType::Struct(storage), first_leaf)) = &self.storage else {
+            return 0;
+        };
+        child_leaf(storage, *first_leaf, "metadata").map_or(0, |(leaf, _)| self.present(leaf))
+    }
+
+    /// The fields of the field's top-level `typed_value` object, if it is
+    /// shredded as one, with the object's first leaf index.
+    fn typed_value_fields(&self) -> Option<(usize, Fields)> {
+        let (DataType::Struct(storage), first_leaf) = self.storage.as_ref()? else {
+            return None;
+        };
+        let (leaf, typed) = child_leaf(storage, *first_leaf, "typed_value")?;
+        match typed.data_type() {
+            DataType::Struct(fields) => Some((leaf, fields.clone())),
+            _ => None,
+        }
+    }
+
+    /// Adds every shredded scalar leaf under `fields`, whose leaves start at
+    /// `first_leaf`, at `path` to `leaves`.
     ///
     /// A shredded field is a struct of `value` and `typed_value`; its
     /// `typed_value` is either a scalar leaf or a nested object. Anything else,
@@ -322,31 +408,29 @@ impl<'a> FooterCounts<'a> {
     fn collect_leaves(
         &self,
         fields: &Fields,
+        first_leaf: usize,
         path: &mut Vec<String>,
         leaves: &mut BTreeMap<Vec<String>, Vec<(Scalar, usize)>>,
     ) {
+        let mut next_leaf = first_leaf;
         for field in fields {
+            let element_leaf = next_leaf;
+            next_leaf += leaf_count(field.data_type());
             let DataType::Struct(element) = field.data_type() else {
                 continue;
             };
-            let Some((_, typed)) = element.find("typed_value") else {
+            let Some((typed_leaf, typed)) = child_leaf(element, element_leaf, "typed_value") else {
                 continue;
             };
             path.push(field.name().clone());
             match typed.data_type() {
-                DataType::Struct(nested) => self.collect_leaves(nested, path, leaves),
+                DataType::Struct(nested) => self.collect_leaves(nested, typed_leaf, path, leaves),
                 data_type => {
                     if let Some(scalar) = Scalar::from_data_type(data_type) {
-                        let mut parts = vec![self.column, "typed_value"];
-                        for key in path.iter() {
-                            parts.push(key);
-                            parts.push("typed_value");
-                        }
-                        let count = self.present(&parts);
                         leaves
                             .entry(path.clone())
                             .or_default()
-                            .push((scalar, count));
+                            .push((scalar, self.present(typed_leaf)));
                     }
                 }
             }
@@ -374,7 +458,7 @@ pub struct VariantSampler {
     rows: Vec<usize>,
     /// Rows kept per sampling stratum.
     kept: Vec<usize>,
-    /// Counters for every top-level Variant column.
+    /// Counters for every Variant field.
     analyzer: VariantLayoutAnalyzer,
 }
 
@@ -423,28 +507,32 @@ impl VariantSampler {
         }
     }
 
-    /// Whether the input has no Variant column, so nothing needs sampling.
+    /// Whether the input has no Variant field, so nothing needs sampling.
     pub fn is_inert(&self) -> bool {
         self.analyzer.columns.is_empty()
     }
 
-    /// Names of the Variant columns [`Self::offer`] reads; a caller projects only these.
+    /// Names of the top-level columns holding the Variant fields [`Self::offer`]
+    /// reads, each once; a caller projects only these.
     pub fn column_names(&self) -> impl Iterator<Item = &str> {
+        let mut seen = BTreeSet::new();
         self.analyzer
             .columns
             .iter()
-            .map(|sample| sample.name.as_str())
+            .map(|sample| sample.path[0].as_str())
+            .filter(move |name| seen.insert(*name))
     }
 
     /// Offers every row of `batch`; row `i` is in caller stratum `strata[i]` at position `first_position + i`.
     ///
-    /// `batch` needs only the Variant columns, found by name; other columns are ignored.
+    /// `batch` needs only the columns [`Self::column_names`] names, found by
+    /// name; other columns are ignored.
     ///
     /// # Errors
     ///
     /// Returns an error when `strata` does not have one entry per row, names an
-    /// unknown stratum, a Variant column is missing from `batch`, or a Variant
-    /// column cannot be read as Variant storage.
+    /// unknown stratum, a Variant field is missing from `batch`, or a Variant
+    /// field cannot be read as Variant storage.
     pub fn offer(
         &mut self,
         batch: &RecordBatch,
@@ -517,33 +605,33 @@ struct StratumRule {
     weight: f64,
 }
 
-/// Sample counters for every top-level Variant column of one input.
+/// Sample counters for every Variant field of one input.
 struct VariantLayoutAnalyzer {
     /// Parameters and caps.
     policy: VariantShreddingPolicy,
-    /// Counters per Variant column.
+    /// Counters per Variant field.
     columns: Vec<ColumnSample>,
 }
 
-/// Counters for one top-level Variant column.
+/// Counters for one Variant field, at any Struct or List depth.
 struct ColumnSample {
-    /// Index of the column in the logical schema.
-    index: usize,
-    /// Name the column is found by in offered batches.
-    name: String,
-    /// Sampled non-null roots per sampling stratum.
+    /// Name path of the field; its first name is the top-level column found
+    /// in offered batches.
+    path: Vec<String>,
+    /// Sampled non-null roots per sampling stratum; inside a List, each
+    /// non-null element value is one root.
     roots: BTreeMap<usize, usize>,
     /// Fields of root values that are objects.
     node: ObjectNode,
 }
 
 impl VariantLayoutAnalyzer {
-    /// Finds the top-level Variant columns of `schema`.
+    /// Finds every Variant field of `schema`, at any Struct or List depth.
     fn new(schema: &Schema, policy: VariantShreddingPolicy) -> Self {
-        let columns = variant_columns(schema)
-            .map(|(index, field)| ColumnSample {
-                index,
-                name: field.name().clone(),
+        let columns = variant_field_paths(schema.fields())
+            .into_iter()
+            .map(|path| ColumnSample {
+                path,
                 roots: BTreeMap::new(),
                 node: ObjectNode::default(),
             })
@@ -555,22 +643,16 @@ impl VariantLayoutAnalyzer {
     ///
     /// # Errors
     ///
-    /// Returns an error when a Variant column is missing from `batch` or is not Variant storage.
+    /// Returns an error when a Variant field is missing from `batch` or is not Variant storage.
     fn observe(&mut self, batch: &RecordBatch, chosen: &[(usize, usize)]) -> Result<()> {
         for sample in &mut self.columns {
-            let column = batch.column_by_name(&sample.name).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Variant sample batch has no column {}.", sample.name),
-                )
-            })?;
-            let variant = VariantArray::try_new(column.as_ref()).map_err(variant_error)?;
-            for &(row, stratum) in chosen {
-                if variant.is_null(row) {
+            let (variant, values) = sample.values(batch, chosen)?;
+            for (index, stratum) in values {
+                if variant.is_null(index) {
                     continue;
                 }
                 *sample.roots.entry(stratum).or_default() += 1;
-                if let Variant::Object(object) = variant.value(row) {
+                if let Variant::Object(object) = variant.value(index) {
                     sample
                         .node
                         .observe_object(&object, 1, stratum, &self.policy);
@@ -580,10 +662,10 @@ impl VariantLayoutAnalyzer {
         Ok(())
     }
 
-    /// Chooses each column's shredding type; `weights[h]` is the input rows per sampled row of stratum `h`.
+    /// Chooses each field's shredding type; `weights[h]` is the input rows per sampled row of stratum `h`.
     fn layout(&self, weights: &[f64]) -> VariantLayout {
         let fraction = (self.policy.min_frequency - self.policy.margin).max(0.0);
-        let columns = self
+        let fields = self
             .columns
             .iter()
             .filter_map(|sample| {
@@ -601,10 +683,68 @@ impl VariantLayoutAnalyzer {
                 sample
                     .node
                     .shredding_type(&rules, &self.policy)
-                    .map(|shredding_type| (sample.index, shredding_type))
+                    .map(|shredding_type| (sample.path.clone(), shredding_type))
             })
             .collect();
-        VariantLayout { columns }
+        VariantLayout { fields }
+    }
+}
+
+impl ColumnSample {
+    /// The field's Variant values in the `chosen` rows of `batch`: the
+    /// Variant array and the index and stratum of each value.
+    ///
+    /// The walk follows the path from the top-level column: a Struct step
+    /// keeps the values whose Struct is valid, and a List step expands each
+    /// valid List into its elements, so a row inside a List holds one value
+    /// per element.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is missing from `batch` or does not end
+    /// at Variant storage.
+    fn values(
+        &self,
+        batch: &RecordBatch,
+        chosen: &[(usize, usize)],
+    ) -> Result<(VariantArray, Vec<(usize, usize)>)> {
+        let missing = || {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Variant sample batch has no field {}.", self.path.join(".")),
+            )
+        };
+        let mut array = Arc::clone(batch.column_by_name(&self.path[0]).ok_or_else(missing)?);
+        let mut values: Vec<(usize, usize)> = chosen.to_vec();
+        for step in &self.path[1..] {
+            array = match array.data_type() {
+                DataType::List(_) => {
+                    let list = array.as_list::<i32>();
+                    values = values
+                        .into_iter()
+                        .filter(|&(index, _)| list.is_valid(index))
+                        .flat_map(|(index, stratum)| {
+                            {
+                                list.value_offsets()[index] as usize
+                                    ..list.value_offsets()[index + 1] as usize
+                            }
+                            .map(move |element| (element, stratum))
+                        })
+                        .collect();
+                    Arc::clone(list.values())
+                }
+                DataType::Struct(_) => {
+                    let parent = array.as_struct();
+                    values.retain(|&(index, _)| parent.is_valid(index));
+                    Arc::clone(parent.column_by_name(step).ok_or_else(missing)?)
+                }
+                _ => return Err(missing()),
+            };
+        }
+        Ok((
+            VariantArray::try_new(array.as_ref()).map_err(variant_error)?,
+            values,
+        ))
     }
 }
 
@@ -1133,7 +1273,7 @@ mod tests {
     fn infer_with(json: &[Option<&str>], policy: VariantShreddingPolicy) -> Option<DataType> {
         let batch = variant_batch(json);
         sample(&batch, &vec![0; json.len()], policy, 7)
-            .shredding_type(0)
+            .shredding_type(&["v"])
             .cloned()
     }
 
@@ -1215,10 +1355,10 @@ mod tests {
         strata.extend(std::iter::repeat_n(1, 60));
         let batch = variant_batch(&json);
         let own = sample(&batch, &strata, POLICY, 7);
-        assert!(names(own.shredding_type(0)).contains(&"rare".to_string()));
+        assert!(names(own.shredding_type(&["v"])).contains(&"rare".to_string()));
         let one = sample(&batch, &vec![0; 100], POLICY, 7);
         assert!(
-            !names(one.shredding_type(0)).contains(&"rare".to_string()),
+            !names(one.shredding_type(&["v"])).contains(&"rare".to_string()),
             "4 of 100 rows is below 8% without strata"
         );
 
@@ -1230,7 +1370,7 @@ mod tests {
         strata.extend(std::iter::repeat_n(2, 75));
         let merged = sample(&variant_batch(&json), &strata, POLICY, 7);
         assert!(
-            names(merged.shredding_type(0)).contains(&"tiny".to_string()),
+            names(merged.shredding_type(&["v"])).contains(&"tiny".to_string()),
             "5 of the 25 rows in the merged small-writer stratum"
         );
     }
@@ -1260,7 +1400,7 @@ mod tests {
             kept.abs_diff(expected) < expected / 10,
             "kept {kept}, expected about {expected}"
         );
-        assert_eq!(names(layout.shredding_type(0)).len(), 7);
+        assert_eq!(names(layout.shredding_type(&["v"])).len(), 7);
     }
 
     /// At the cap, children are kept by estimated rows covered, not raw sampled counts.
@@ -1334,7 +1474,7 @@ mod tests {
         assert_eq!(
             shredded_fields(
                 sample(&batch, &[0, 0], POLICY, 7)
-                    .shredding_type(0)
+                    .shredding_type(&["v"])
                     .cloned()
             ),
             [("d".to_string(), DataType::Decimal64(18, 3))]
@@ -1419,6 +1559,108 @@ mod tests {
         ]);
     }
 
+    /// A batch with one `events: List<Struct<name, attributes: Variant>>`
+    /// column; row `r` holds one event per JSON document in `rows[r]`.
+    fn events_batch(rows: &[&[&str]]) -> RecordBatch {
+        let documents: Vec<&str> = rows.iter().flat_map(|row| row.iter().copied()).collect();
+        let json = Arc::new(StringArray::from(documents.clone())) as ArrayRef;
+        let attributes = json_to_variant(&json).unwrap();
+        let element = Fields::from(vec![
+            Arc::new(arrow_schema::Field::new("name", DataType::Utf8, true)),
+            Arc::new(attributes.field("attributes")),
+        ]);
+        let structs = arrow_array::StructArray::try_new(
+            element.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["e"; documents.len()])),
+                attributes.into(),
+            ],
+            None,
+        )
+        .unwrap();
+        let element = Arc::new(arrow_schema::Field::new(
+            "element",
+            DataType::Struct(element),
+            true,
+        ));
+        let events = arrow_array::ListArray::try_new(
+            Arc::clone(&element),
+            arrow_buffer::OffsetBuffer::from_lengths(rows.iter().map(|row| row.len())),
+            Arc::new(structs),
+            None,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![arrow_schema::Field::new(
+                "events",
+                DataType::List(element),
+                true,
+            )])),
+            vec![Arc::new(events)],
+        )
+        .unwrap()
+    }
+
+    /// The JSON of every event's attributes in an `events` batch, logical or shredded.
+    fn events_json(batch: &RecordBatch) -> Vec<Option<String>> {
+        let (_, events) = crate::arrow::unshred_variants(
+            batch.schema().fields().first().unwrap(),
+            batch.column(0),
+        )
+        .unwrap();
+        let structs = events.as_list::<i32>().values().as_struct();
+        parquet::variant::variant_to_json(structs.column_by_name("attributes").unwrap())
+            .unwrap()
+            .iter()
+            .map(|json| json.map(str::to_owned))
+            .collect()
+    }
+
+    /// Span event attributes, a Variant inside a List of Structs, are
+    /// sampled with each event as one root, shredded in place, read back
+    /// unchanged, and combined from footers like a top-level column.
+    #[test]
+    fn variants_inside_lists_are_sampled_shredded_and_combined() {
+        let row: &[&str] = &[r#"{"k":1,"s":"a"}"#, r#"{"k":2,"s":"b","rare":true}"#];
+        let mut rows = vec![row; 20];
+        let tail: &[&str] = &[r#"{"k":"text"}"#];
+        rows.push(tail);
+        let batch = events_batch(&rows);
+        let path = ["events", "element", "attributes"];
+        let layout = sample(&batch, &vec![0; batch.num_rows()], POLICY, 7);
+        // `k` holds integers and one string, so it stays residual.
+        assert_eq!(names(layout.shredding_type(&path)), ["rare", "s"]);
+
+        let shredded = layout.shred(&batch).unwrap();
+        assert_ne!(shredded.schema(), batch.schema());
+        assert_eq!(events_json(&shredded), events_json(&batch));
+
+        let footer = shredded_footer(&batch);
+        let [leaves] =
+            <[VariantLeaves; 1]>::try_from(variant_leaves(&batch.schema(), &footer).unwrap())
+                .unwrap();
+        let descr = footer.file_metadata().schema_descr();
+        let at = |leaf: usize| descr.column(leaf).path().string();
+        assert_eq!(leaves.all.clone().map(at).collect::<Vec<_>>(), [
+            "events.list.element.attributes.metadata",
+            "events.list.element.attributes.value",
+            "events.list.element.attributes.typed_value.rare.value",
+            "events.list.element.attributes.typed_value.rare.typed_value",
+            "events.list.element.attributes.typed_value.s.value",
+            "events.list.element.attributes.typed_value.s.typed_value",
+        ]);
+        assert_eq!(
+            leaves.metadata.map(at).unwrap(),
+            "events.list.element.attributes.metadata"
+        );
+        assert_eq!(
+            leaves.value.map(at).unwrap(),
+            "events.list.element.attributes.value"
+        );
+        let combined = VariantLayout::combine(&batch.schema(), &[footer], &POLICY).unwrap();
+        assert_eq!(names(combined.shredding_type(&path)), ["rare", "s"]);
+    }
+
     /// Footer counts combine across sources: same-family types widen, a field
     /// below 10% of the combined roots is dropped, and nested leaves survive.
     #[test]
@@ -1432,7 +1674,7 @@ mod tests {
         ];
         let schema = variant_batch(&[None]).schema();
         let layout = VariantLayout::combine(&schema, &footers, &POLICY).unwrap();
-        let fields = shredded_fields(layout.shredding_type(0).cloned());
+        let fields = shredded_fields(layout.shredding_type(&["v"]).cloned());
         let by_name: BTreeMap<_, _> = fields.into_iter().collect();
         assert_eq!(
             by_name.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -1451,7 +1693,7 @@ mod tests {
         ];
         let schema = variant_batch(&[None]).schema();
         let layout = VariantLayout::combine(&schema, &footers, &POLICY).unwrap();
-        assert_eq!(shredded_fields(layout.shredding_type(0).cloned()), [(
+        assert_eq!(shredded_fields(layout.shredding_type(&["v"]).cloned()), [(
             "x".to_string(),
             DataType::Utf8
         )]);

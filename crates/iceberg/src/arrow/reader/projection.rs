@@ -24,7 +24,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
@@ -399,51 +398,27 @@ impl ArrowReader {
     }
 }
 
-/// Unshreds every top-level shredded Variant column of a batch read from a file.
+/// Unshreds every shredded Variant of a batch read from a file, at any
+/// Struct or List depth, through [`unshred_variants`](crate::arrow::unshred_variants).
 ///
-/// A file may store a Variant column shredded (with a `typed_value` field),
-/// and each file may shred differently. Readers return the logical
+/// A file may store a Variant shredded (with a `typed_value` field), and
+/// each file may shred differently. Readers return the logical
 /// `metadata`/`value` storage, so every file of a table yields the same
-/// column type before batches are combined. Columns that are not shredded
-/// are returned unchanged without copying.
+/// column type before batches are combined. Columns without a shredded
+/// Variant are returned unchanged without copying.
 ///
 /// # Errors
 ///
-/// Returns an error when a shredded column is not valid Variant storage or
+/// Returns an error when a shredded Variant is not valid Variant storage or
 /// Arrow cannot unshred it.
 pub(super) fn unshred_variant_columns(batch: RecordBatch) -> Result<RecordBatch> {
-    use parquet::variant::{VariantArray, VariantType, unshred_variant};
-
-    let is_shredded = |field: &Field| {
-        field.extension_type_name() == Some(<VariantType as ExtensionType>::NAME)
-            && matches!(field.data_type(), DataType::Struct(children)
-                if children.iter().any(|child| child.name() == "typed_value"))
-    };
     let schema = batch.schema();
-    if !schema.fields().iter().any(|field| is_shredded(field)) {
-        return Ok(batch);
-    }
-    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    for (index, field) in schema.fields().iter().enumerate() {
-        if !is_shredded(field) {
-            continue;
-        }
-        let variant_error = |err| {
-            Error::new(ErrorKind::DataInvalid, "Failed to unshred variant column").with_source(err)
-        };
-        let logical: ArrayRef = unshred_variant(
-            &VariantArray::try_new(columns[index].as_ref()).map_err(variant_error)?,
-        )
-        .map_err(variant_error)?
-        .into();
-        fields[index] = Arc::new(
-            field
-                .as_ref()
-                .clone()
-                .with_data_type(logical.data_type().clone()),
-        );
-        columns[index] = logical;
+    let mut fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let (field, column) = crate::arrow::unshred_variants(field, column)?;
+        fields.push(field);
+        columns.push(column);
     }
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
     Ok(RecordBatch::try_new_with_options(

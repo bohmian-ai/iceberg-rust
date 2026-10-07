@@ -33,8 +33,8 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{
-    datum_to_arrow_type_with_ree, primitive_type_to_arrow_type_with_ree, schema_to_arrow_schema,
-    type_to_arrow_type,
+    datum_to_arrow_type_with_ree, primitive_type_to_arrow_type_with_ree, rebuild_by_name,
+    schema_to_arrow_schema, type_to_arrow_type,
 };
 use crate::metadata_columns::{
     RESERVED_COL_NAME_PARTITION, RESERVED_FIELD_ID_PARTITION, get_metadata_field,
@@ -960,7 +960,7 @@ impl RecordBatchTransformer {
                     ColumnSource::Promote {
                         target_type,
                         source_index,
-                    } => Self::promote(&columns[*source_index], target_type)?,
+                    } => rebuild_by_name(&columns[*source_index], target_type)?,
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
@@ -1049,54 +1049,6 @@ impl RecordBatchTransformer {
             // Non-REE type (simple arrays for non-constant fields)
             create_primitive_array_repeated(target_type, prim_lit, num_rows)
         }
-    }
-
-    /// Promotes `source` to `target_type`.
-    ///
-    /// A struct whose children differ by name from the target's is rebuilt by
-    /// name: each child the file read is promoted, and each child it did not
-    /// read is null when nullable. A required child is only missing when a
-    /// [`ParquetFileReadNarrowing::projection`](crate::arrow::ParquetFileReadNarrowing)
-    /// skipped it, since a required field cannot be added without a default;
-    /// that child holds zeroed values the narrowing's caller never reads.
-    /// Everything else is an Arrow cast.
-    fn promote(source: &ArrayRef, target_type: &DataType) -> Result<ArrayRef> {
-        let (DataType::Struct(read), DataType::Struct(target)) = (source.data_type(), target_type)
-        else {
-            return Ok(cast(source, target_type)?);
-        };
-        if read.len() == target.len()
-            && read
-                .iter()
-                .zip(target.iter())
-                .all(|(read, target)| read.name() == target.name())
-        {
-            return Ok(cast(source, target_type)?);
-        }
-        let source = source
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("a Struct-typed array is a StructArray");
-        let children = target
-            .iter()
-            .map(|field| match source.column_by_name(field.name()) {
-                Some(child) => Self::promote(child, field.data_type()),
-                None => {
-                    let nulls = arrow_array::new_null_array(field.data_type(), source.len());
-                    if field.is_nullable() {
-                        return Ok(nulls);
-                    }
-                    Ok(arrow_array::make_array(
-                        nulls.into_data().into_builder().nulls(None).build()?,
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(StructArray::try_new(
-            target.clone(),
-            children,
-            source.nulls().cloned(),
-        )?))
     }
 
     fn create_struct_column(

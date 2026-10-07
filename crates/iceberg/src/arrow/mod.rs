@@ -20,6 +20,11 @@
 mod schema;
 pub use schema::*;
 
+mod nested_variant;
+pub use nested_variant::{
+    is_variant_field, map_variant_field, map_variant_fields, rebuild_by_name, unshred_variants,
+    variant_field_paths,
+};
 mod nan_val_cnt_visitor;
 pub use nan_val_cnt_visitor::*;
 pub(crate) mod caching_delete_file_loader;

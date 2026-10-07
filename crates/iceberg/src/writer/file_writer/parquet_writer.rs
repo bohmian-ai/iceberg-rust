@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use arrow_schema::{DataType, Field, SchemaRef as ArrowSchemaRef};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use itertools::Itertools;
@@ -139,11 +139,11 @@ impl ParquetWriterBuilder {
 
     /// Encode files with `physical` instead of the Arrow schema derived from the Iceberg schema.
     ///
-    /// `physical` must equal the derived schema except that a top-level Variant
-    /// field may use standard shredded storage (`metadata`, `value`,
-    /// `typed_value`). Field names, order, nullability, and metadata (field ids
-    /// and the Variant extension) are unchanged, so `DataFile` metrics and field
-    /// identity stay logical.
+    /// `physical` must equal the derived schema except that a Variant field,
+    /// at any Struct or List depth, may use standard shredded storage
+    /// (`metadata`, `value`, `typed_value`). Field names, order, nullability,
+    /// and metadata (field ids and the Variant extension) are unchanged, so
+    /// `DataFile` metrics and field identity stay logical.
     ///
     /// # Errors
     ///
@@ -151,18 +151,11 @@ impl ParquetWriterBuilder {
     pub fn with_physical_schema(mut self, physical: ArrowSchemaRef) -> Result<Self> {
         let logical: arrow_schema::Schema = self.schema.as_ref().try_into()?;
         let compatible = logical.fields().len() == physical.fields().len()
-            && logical.fields().iter().zip(physical.fields()).all(|(logical, physical)| {
-                logical.name() == physical.name()
-                    && logical.is_nullable() == physical.is_nullable()
-                    && logical.metadata() == physical.metadata()
-                    && (logical.data_type() == physical.data_type()
-                        || (logical.extension_type_name()
-                            == Some(<parquet::variant::VariantType as arrow_schema::extension::ExtensionType>::NAME)
-                            && parquet::variant::VariantArray::try_new(
-                                arrow_array::new_empty_array(physical.data_type()).as_ref(),
-                            )
-                            .is_ok()))
-            });
+            && logical
+                .fields()
+                .iter()
+                .zip(physical.fields())
+                .all(|(logical, physical)| shreds_only_variants(logical, physical));
         if !compatible {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -171,6 +164,39 @@ impl ParquetWriterBuilder {
         }
         self.physical_schema = Some(physical);
         Ok(self)
+    }
+}
+
+/// Whether `physical` equals `logical` except that each Variant field inside
+/// it, at any Struct or List depth, may use standard shredded storage.
+fn shreds_only_variants(logical: &Field, physical: &Field) -> bool {
+    if logical.name() != physical.name()
+        || logical.is_nullable() != physical.is_nullable()
+        || logical.metadata() != physical.metadata()
+    {
+        return false;
+    }
+    if logical.data_type() == physical.data_type() {
+        return true;
+    }
+    if crate::arrow::is_variant_field(logical) {
+        return parquet::variant::VariantArray::try_new(
+            arrow_array::new_empty_array(physical.data_type()).as_ref(),
+        )
+        .is_ok();
+    }
+    match (logical.data_type(), physical.data_type()) {
+        (DataType::List(logical), DataType::List(physical)) => {
+            shreds_only_variants(logical, physical)
+        }
+        (DataType::Struct(logical), DataType::Struct(physical)) => {
+            logical.len() == physical.len()
+                && logical
+                    .iter()
+                    .zip(physical)
+                    .all(|(logical, physical)| shreds_only_variants(logical, physical))
+        }
+        _ => false,
     }
 }
 
@@ -1214,7 +1240,7 @@ mod tests {
         assert!(
             builder
                 .clone()
-                .with_physical_schema(with_type(1, DataType::Struct(shredded.into())))
+                .with_physical_schema(with_type(1, DataType::Struct(shredded.clone().into())))
                 .is_ok()
         );
         assert!(
@@ -1226,6 +1252,75 @@ mod tests {
         assert!(
             builder
                 .with_physical_schema(with_type(1, DataType::Utf8))
+                .is_err()
+        );
+
+        // The same storage is accepted for a Variant inside a List of Structs,
+        // and any other nested difference is still refused.
+        let nested = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(
+                        1,
+                        "events",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                2,
+                                Type::Struct(StructType::new(vec![
+                                    NestedField::optional(
+                                        3,
+                                        "name",
+                                        Type::Primitive(PrimitiveType::String),
+                                    )
+                                    .into(),
+                                    NestedField::optional(
+                                        4,
+                                        "attributes",
+                                        Type::Variant(VariantType),
+                                    )
+                                    .into(),
+                                ])),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let logical: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&nested).unwrap());
+        let builder = ParquetWriterBuilder::new(WriterProperties::builder().build(), nested);
+        let with_child = |index: usize, data_type: DataType| -> ArrowSchemaRef {
+            let events = logical.field(0);
+            let DataType::List(element) = events.data_type() else {
+                panic!("events is a List");
+            };
+            let DataType::Struct(children) = element.data_type() else {
+                panic!("an event is a Struct");
+            };
+            let mut children: Vec<_> = children.iter().cloned().collect();
+            children[index] = Arc::new(children[index].as_ref().clone().with_data_type(data_type));
+            let element = element
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Struct(children.into()));
+            Arc::new(arrow_schema::Schema::new(vec![
+                events
+                    .clone()
+                    .with_data_type(DataType::List(Arc::new(element))),
+            ]))
+        };
+        assert!(
+            builder
+                .clone()
+                .with_physical_schema(with_child(1, DataType::Struct(shredded.into())))
+                .is_ok()
+        );
+        assert!(
+            builder
+                .with_physical_schema(with_child(0, DataType::Int64))
                 .is_err()
         );
     }
