@@ -49,8 +49,9 @@ use crate::{Error, ErrorKind, Result};
 /// Internal bounds and thresholds that decide one file's Variant layout.
 ///
 /// The values are supplied by the owning writer at construction. They are
-/// policy constants, not table or user configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// policy constants, not table or user configuration. The default has zero
+/// bounds: it samples nothing, so files are never shredded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VariantShreddingPolicy {
     /// Rows retained before the layout is inferred.
     pub max_rows: usize,
@@ -996,6 +997,22 @@ mod tests {
             "a".to_string(),
             DataType::Int8
         )]);
+    }
+
+    /// The default policy samples nothing, so it writes unshredded files.
+    #[test]
+    fn default_policy_never_shreds() {
+        let batch = variant_batch(&[Some(r#"{"a":1}"#)]);
+        let mut prefix = VariantPrefix::new(
+            &batch.schema(),
+            VariantShreddingPolicy::default(),
+            RecordBatch::get_array_memory_size,
+        );
+        let PrefixStep::Ready(ready) = prefix.push(&batch).unwrap() else {
+            panic!("a zero row bound is reached at once");
+        };
+        assert!(ready.layout.is_unshredded());
+        assert_eq!(ready.remainder.map(|rest| rest.num_rows()), Some(1));
     }
 
     /// Shredding keeps logical values: a later value that does not fit the type goes to the residual.
