@@ -56,6 +56,11 @@ pub struct ParquetWriterBuilder {
     props: WriterProperties,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
+    /// Per-file Arrow schema to encode with instead of the one derived from `schema`.
+    ///
+    /// Set only through [`Self::with_physical_schema`], which accepts nothing but
+    /// standard shredded storage for top-level Variant columns.
+    physical_schema: Option<ArrowSchemaRef>,
 }
 
 impl ParquetWriterBuilder {
@@ -80,6 +85,7 @@ impl ParquetWriterBuilder {
             props,
             schema,
             match_mode,
+            physical_schema: None,
         }
     }
 
@@ -124,6 +130,47 @@ impl ParquetWriterBuilder {
     pub fn with_match_mode(mut self, match_mode: FieldMatchMode) -> Self {
         self.match_mode = match_mode;
         self
+    }
+
+    /// The Iceberg schema every file is written under.
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Encode files with `physical` instead of the Arrow schema derived from the Iceberg schema.
+    ///
+    /// `physical` must equal the derived schema except that a top-level Variant
+    /// field may use standard shredded storage (`metadata`, `value`,
+    /// `typed_value`). Field names, order, nullability, and metadata (field ids
+    /// and the Variant extension) are unchanged, so `DataFile` metrics and field
+    /// identity stay logical.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `physical` differs in any other way.
+    pub fn with_physical_schema(mut self, physical: ArrowSchemaRef) -> Result<Self> {
+        let logical: arrow_schema::Schema = self.schema.as_ref().try_into()?;
+        let compatible = logical.fields().len() == physical.fields().len()
+            && logical.fields().iter().zip(physical.fields()).all(|(logical, physical)| {
+                logical.name() == physical.name()
+                    && logical.is_nullable() == physical.is_nullable()
+                    && logical.metadata() == physical.metadata()
+                    && (logical.data_type() == physical.data_type()
+                        || (logical.extension_type_name()
+                            == Some(<parquet::variant::VariantType as arrow_schema::extension::ExtensionType>::NAME)
+                            && parquet::variant::VariantArray::try_new(
+                                arrow_array::new_empty_array(physical.data_type()).as_ref(),
+                            )
+                            .is_ok()))
+            });
+        if !compatible {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Physical schema differs from the table schema beyond Variant shredding.",
+            ));
+        }
+        self.physical_schema = Some(physical);
+        Ok(self)
     }
 }
 
@@ -172,6 +219,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
+            physical_schema: self.physical_schema.clone(),
         })
     }
 }
@@ -194,6 +242,10 @@ struct IndexByParquetPathName {
     /// column. See the statistics loop in `to_data_file_builder`.
     variant_field_ids: HashSet<i32>,
 
+    /// Logical path of every variant column, so shredded `typed_value` leaves
+    /// under it resolve to the variant.
+    variant_paths: Vec<(String, i32)>,
+
     field_names: Vec<String>,
 
     field_id: i32,
@@ -205,14 +257,26 @@ impl IndexByParquetPathName {
         Self {
             name_to_id: HashMap::new(),
             variant_field_ids: HashSet::new(),
+            variant_paths: Vec::new(),
             field_names: Vec::new(),
             field_id: 0,
         }
     }
 
     /// Retrieves the internal field ID
+    ///
+    /// A shredded variant's `typed_value` leaves are not indexed one by one;
+    /// any leaf under an indexed variant path resolves to that variant.
     pub fn get(&self, name: &str) -> Option<&i32> {
-        self.name_to_id.get(name)
+        self.name_to_id.get(name).or_else(|| {
+            self.variant_paths
+                .iter()
+                .find(|(base, _)| {
+                    name.strip_prefix(base.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+                })
+                .map(|(_, field_id)| field_id)
+        })
     }
 
     /// Whether `field_id` is a variant column, i.e. one whose statistics come from two physical
@@ -253,6 +317,7 @@ impl IndexByParquetPathName {
     fn insert_current_variant_path(&mut self) -> Result<()> {
         let base = self.current_path();
         self.variant_field_ids.insert(self.field_id);
+        self.variant_paths.push((base.clone(), self.field_id));
         self.insert_path(format!("{base}.{VARIANT_METADATA_LEAF}"))?;
         self.insert_path(format!("{base}.{VARIANT_VALUE_LEAF}"))
     }
@@ -350,6 +415,8 @@ pub struct ParquetWriter {
     writer_properties: WriterProperties,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
+    /// Arrow schema to encode with, when the builder was given one.
+    physical_schema: Option<ArrowSchemaRef>,
 }
 
 /// Used to aggregate min and max value of each column.
@@ -529,7 +596,15 @@ impl ParquetWriter {
                     //   variants and could make a planner wrongly prune an `IS NOT NULL`
                     //   predicate.
                     if index_by_parquet_path.is_variant_field(field_id) {
-                        match parquet_path.rsplit('.').next() {
+                        // Only the variant's own top-level leaves are indexed exactly; a
+                        // shredded `typed_value` leaf (which may also end in `value`)
+                        // contributes size only.
+                        let top_level_leaf = index_by_parquet_path
+                            .name_to_id
+                            .contains_key(parquet_path.as_str())
+                            .then(|| parquet_path.rsplit('.').next())
+                            .flatten();
+                        match top_level_leaf {
                             Some(VARIANT_VALUE_LEAF) => {
                                 *per_col_val_num.entry(field_id).or_insert(0) +=
                                     column_chunk_metadata.num_values() as u64;
@@ -662,7 +737,10 @@ impl FileWriter for ParquetWriter {
             writer
         } else {
             let arrow_schema: ArrowSchemaRef = {
-                let schema: arrow_schema::Schema = self.schema.as_ref().try_into()?;
+                let schema: arrow_schema::Schema = match &self.physical_schema {
+                    Some(physical) => physical.as_ref().clone(),
+                    None => self.schema.as_ref().try_into()?,
+                };
                 let mut metadata = schema.metadata().clone();
                 metadata.insert(
                     ICEBERG_SCHEMA_KEY.to_string(),
@@ -992,6 +1070,132 @@ mod tests {
     ///    physical leaves onto the group's field id, because the leaves cannot be resolved by id).
     ///    Pinned deliberately so that if arrow/parquet ever starts emitting sub-field ids, this
     ///    test fails and points at the statistics logic that assumes they are absent.
+    /// Each rolled output of the deferred Variant writer infers its own layout from its own rows.
+    ///
+    /// The prefix bound is two rows and the roll target one byte, so each
+    /// two-row batch lands in its own output. Output 1 holds only `{"a": int}`
+    /// objects and output 2 only `{"b": string}` objects, so each file must
+    /// shred exactly its own field; every value must read back unchanged and
+    /// the `DataFile` metrics must stay logical.
+    #[tokio::test]
+    async fn variant_builder_infers_each_rolled_output() -> Result<()> {
+        use parquet::variant::{VariantArray, json_to_variant, unshred_variant, variant_to_json};
+
+        use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+        use crate::writer::file_writer::VariantParquetWriterBuilder;
+        use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+        use crate::writer::file_writer::variant_shredding::VariantShreddingPolicy;
+        use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let batch = |ids: [i64; 2], json: [&str; 2]| -> RecordBatch {
+            let json = Arc::new(arrow_array::StringArray::from(json.to_vec())) as ArrayRef;
+            let variant: ArrayRef = json_to_variant(&json).unwrap().into();
+            let variant = arrow_cast::cast(&variant, arrow_schema.field(1).data_type()).unwrap();
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                variant,
+            ])
+            .unwrap()
+        };
+        let policy = VariantShreddingPolicy {
+            max_rows: 2,
+            max_bytes: usize::MAX,
+            min_frequency_percent: 10,
+            max_tracked_children: 1_000,
+            max_emitted_children: 300,
+            max_depth: 50,
+        };
+        let mut writer = DataFileWriterBuilder::new(RollingFileWriterBuilder::new(
+            VariantParquetWriterBuilder::new(
+                ParquetWriterBuilder::new(WriterProperties::builder().build(), schema.clone()),
+                policy,
+            ),
+            1,
+            file_io.clone(),
+            DefaultLocationGenerator::with_data_location(
+                temp_dir.path().to_str().unwrap().to_string(),
+            ),
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet),
+        ))
+        .build(None)
+        .await?;
+        writer
+            .write(batch([1, 2], [r#"{"a":1}"#, r#"{"a":300}"#]))
+            .await?;
+        writer
+            .write(batch([3, 4], [r#"{"b":"x"}"#, r#"{"b":"y"}"#]))
+            .await?;
+        let mut data_files = writer.close().await?;
+        data_files.sort_by_key(|file| file.record_count());
+        assert_eq!(data_files.len(), 2, "one output per batch");
+
+        let mut shredded = Vec::new();
+        let mut values = Vec::new();
+        for data_file in &data_files {
+            assert_eq!(data_file.record_count(), 2);
+            assert!(
+                data_file
+                    .column_sizes()
+                    .get(&2)
+                    .is_some_and(|size| *size > 0),
+                "the variant column keeps a logical size: {:?}",
+                data_file.column_sizes()
+            );
+            let bytes = file_io.new_input(data_file.file_path())?.read().await?;
+            let read = ParquetRecordBatchReaderBuilder::try_new(bytes)?
+                .build()?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let read = concat_batches(&read[0].schema(), &read)?;
+            let v = read.column_by_name("v").expect("variant column").clone();
+            let read_variant = VariantArray::try_new(v.as_ref())?;
+            shredded.push(
+                read_variant
+                    .typed_value_column()
+                    .map(|typed| typed.data_type().clone()),
+            );
+            let logical: ArrayRef = unshred_variant(&read_variant)?.into();
+            values.extend(
+                variant_to_json(&logical)?
+                    .iter()
+                    .map(|json| json.unwrap().to_owned()),
+            );
+        }
+        values.sort();
+        assert_eq!(values, [
+            r#"{"a":1}"#,
+            r#"{"a":300}"#,
+            r#"{"b":"x"}"#,
+            r#"{"b":"y"}"#
+        ]);
+        let shredded_fields: Vec<Vec<String>> = shredded
+            .iter()
+            .map(|typed| match typed {
+                Some(DataType::Struct(fields)) => {
+                    fields.iter().map(|field| field.name().clone()).collect()
+                }
+                other => panic!("each output shreds its object fields, got {other:?}"),
+            })
+            .collect();
+        let mut shredded_fields = shredded_fields;
+        shredded_fields.sort();
+        assert_eq!(shredded_fields, [vec!["a".to_string()], vec![
+            "b".to_string()
+        ]]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_parquet_writer_variant_round_trip() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
