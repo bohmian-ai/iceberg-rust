@@ -1049,27 +1049,6 @@ mod tests {
         assert_eq!(visitor.name_to_id, expect);
     }
 
-    /// A variant column must survive a real write byte-for-byte, and the written file must
-    /// identify the column as a variant.
-    ///
-    /// This closes the last untested leg of the variant round-trip. Everything else that
-    /// exercises variants either reads files written by *another* engine or asserts structure and
-    /// row counts rather than payload bytes — so nothing verified that a variant written through
-    /// this writer comes back unchanged, nor that the output is self-describing as a variant to a
-    /// reader that does not have the Iceberg schema to hand.
-    ///
-    /// Three properties are pinned:
-    ///
-    /// 1. **Byte fidelity** of both variant leaves, including across a null row. The payloads are
-    ///    opaque to the writer, so a corruption here would be silent.
-    /// 2. **`LogicalType::Variant` and the field id on the variant group.** These do hold today,
-    ///    but nothing asserted them; losing either would make our files unidentifiable as
-    ///    variants without out-of-band schema.
-    /// 3. **The two sub-leaves carry no field id.** That absence is not incidental — it is the
-    ///    exact property that made variant statistics get dropped (the path index has to map both
-    ///    physical leaves onto the group's field id, because the leaves cannot be resolved by id).
-    ///    Pinned deliberately so that if arrow/parquet ever starts emitting sub-field ids, this
-    ///    test fails and points at the statistics logic that assumes they are absent.
     /// Each rolled output of the deferred Variant writer infers its own layout from its own rows.
     ///
     /// The prefix bound is two rows and the roll target one byte, so each
@@ -1195,6 +1174,77 @@ mod tests {
         ]]);
         Ok(())
     }
+
+    /// The builder accepts a shredded physical type for a Variant field and nothing else.
+    ///
+    /// Shredding may only replace a top-level Variant field's storage type.
+    /// Changing any other field's type, or giving the Variant field storage
+    /// Arrow cannot read as Variant, is refused.
+    #[test]
+    fn accepts_per_file_variant_physical_schema() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let logical: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let builder = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema);
+        let with_type = |index: usize, data_type: DataType| -> ArrowSchemaRef {
+            let mut fields: Vec<_> = logical.fields().iter().cloned().collect();
+            fields[index] = Arc::new(fields[index].as_ref().clone().with_data_type(data_type));
+            Arc::new(arrow_schema::Schema::new(fields))
+        };
+        let DataType::Struct(storage) = logical.field(1).data_type() else {
+            panic!("Variant storage is a struct");
+        };
+        let mut shredded: Vec<_> = storage.iter().cloned().collect();
+        shredded[1] = Arc::new(shredded[1].as_ref().clone().with_nullable(true));
+        shredded.push(Arc::new(Field::new("typed_value", DataType::Int64, true)));
+
+        assert!(
+            builder
+                .clone()
+                .with_physical_schema(with_type(1, DataType::Struct(shredded.into())))
+                .is_ok()
+        );
+        assert!(
+            builder
+                .clone()
+                .with_physical_schema(with_type(0, DataType::Int32))
+                .is_err()
+        );
+        assert!(
+            builder
+                .with_physical_schema(with_type(1, DataType::Utf8))
+                .is_err()
+        );
+    }
+
+    /// A variant column must survive a real write byte-for-byte, and the written file must
+    /// identify the column as a variant.
+    ///
+    /// This closes the last untested leg of the variant round-trip. Everything else that
+    /// exercises variants either reads files written by *another* engine or asserts structure and
+    /// row counts rather than payload bytes — so nothing verified that a variant written through
+    /// this writer comes back unchanged, nor that the output is self-describing as a variant to a
+    /// reader that does not have the Iceberg schema to hand.
+    ///
+    /// Three properties are pinned:
+    ///
+    /// 1. **Byte fidelity** of both variant leaves, including across a null row. The payloads are
+    ///    opaque to the writer, so a corruption here would be silent.
+    /// 2. **`LogicalType::Variant` and the field id on the variant group.** These do hold today,
+    ///    but nothing asserted them; losing either would make our files unidentifiable as
+    ///    variants without out-of-band schema.
+    /// 3. **The two sub-leaves carry no field id.** That absence is not incidental — it is the
+    ///    exact property that made variant statistics get dropped (the path index has to map both
+    ///    physical leaves onto the group's field id, because the leaves cannot be resolved by id).
+    ///    Pinned deliberately so that if arrow/parquet ever starts emitting sub-field ids, this
+    ///    test fails and points at the statistics logic that assumes they are absent.
 
     #[tokio::test]
     async fn test_parquet_writer_variant_round_trip() -> Result<()> {

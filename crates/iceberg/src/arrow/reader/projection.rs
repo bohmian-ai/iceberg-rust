@@ -23,6 +23,8 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
@@ -142,7 +144,7 @@ impl ArrowReader {
         };
 
         if entering_variant && variant_field_id.is_some() {
-            Self::validate_unshredded_variant_storage(data_type)?;
+            Self::validate_variant_storage(data_type)?;
         }
 
         match data_type {
@@ -194,45 +196,22 @@ impl ArrowReader {
         Ok(())
     }
 
-    fn validate_unshredded_variant_storage(data_type: &DataType) -> Result<()> {
-        let DataType::Struct(fields) = data_type else {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Variant storage must be a Struct, got {data_type}"),
-            ));
-        };
-
-        if fields.iter().any(|field| field.name() == "typed_value") {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Reading shredded variant columns is not supported yet: found a \
-                 `typed_value` sub-field. Only unshredded variants (metadata + value) \
-                 can be read.",
-            ));
-        }
-
-        let is_binary = |data_type: &DataType| {
-            matches!(
-                data_type,
-                DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-            )
-        };
-        let metadata = fields.iter().find(|field| field.name() == "metadata");
-        let value = fields.iter().find(|field| field.name() == "value");
-        if fields.len() != 2
-            || metadata.is_none_or(|field| !is_binary(field.data_type()))
-            || value.is_none_or(|field| !is_binary(field.data_type()))
-        {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Unshredded variant storage must contain exactly binary `metadata` \
-                     and `value` fields, got {data_type}"
-                ),
-            ));
-        }
-
-        Ok(())
+    /// Checks that a Variant column's storage is valid standard Variant storage.
+    ///
+    /// Arrow's [`VariantArray`](parquet::variant::VariantArray) validation
+    /// decides: binary `metadata`, plus `value`, `typed_value`, or both. Shredded
+    /// storage is accepted; [`unshred_variant_columns`] restores the logical
+    /// values after the batch is read.
+    fn validate_variant_storage(data_type: &DataType) -> Result<()> {
+        parquet::variant::VariantArray::try_new(&arrow_array::new_empty_array(data_type))
+            .map(|_| ())
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Invalid variant storage {data_type}"),
+                )
+                .with_source(err)
+            })
     }
 
     pub(super) fn get_arrow_projection_mask(
@@ -418,6 +397,60 @@ impl ArrowReader {
             Ok(ProjectionMask::roots(parquet_schema, root_indices))
         }
     }
+}
+
+/// Unshreds every top-level shredded Variant column of a batch read from a file.
+///
+/// A file may store a Variant column shredded (with a `typed_value` field),
+/// and each file may shred differently. Readers return the logical
+/// `metadata`/`value` storage, so every file of a table yields the same
+/// column type before batches are combined. Columns that are not shredded
+/// are returned unchanged without copying.
+///
+/// # Errors
+///
+/// Returns an error when a shredded column is not valid Variant storage or
+/// Arrow cannot unshred it.
+pub(super) fn unshred_variant_columns(batch: RecordBatch) -> Result<RecordBatch> {
+    use parquet::variant::{VariantArray, VariantType, unshred_variant};
+
+    let is_shredded = |field: &Field| {
+        field.extension_type_name() == Some(<VariantType as ExtensionType>::NAME)
+            && matches!(field.data_type(), DataType::Struct(children)
+                if children.iter().any(|child| child.name() == "typed_value"))
+    };
+    let schema = batch.schema();
+    if !schema.fields().iter().any(|field| is_shredded(field)) {
+        return Ok(batch);
+    }
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    for (index, field) in schema.fields().iter().enumerate() {
+        if !is_shredded(field) {
+            continue;
+        }
+        let variant_error = |err| {
+            Error::new(ErrorKind::DataInvalid, "Failed to unshred variant column").with_source(err)
+        };
+        let logical: ArrayRef = unshred_variant(
+            &VariantArray::try_new(columns[index].as_ref()).map_err(variant_error)?,
+        )
+        .map_err(variant_error)?
+        .into();
+        fields[index] = Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(logical.data_type().clone()),
+        );
+        columns[index] = logical;
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::new(ArrowSchema::new(fields).with_metadata(schema.metadata().clone())),
+        columns,
+        &options,
+    )?)
 }
 
 /// Build the map of parquet field id to Parquet column index in the schema.
@@ -1032,8 +1065,9 @@ message schema {
         );
     }
 
+    /// Shredded Variant storage is accepted; storage Arrow cannot read as Variant is refused.
     #[test]
-    fn test_variant_projection_validates_unshredded_storage() {
+    fn test_variant_projection_validates_storage() {
         let shredded = DataType::Struct(
             vec![
                 Arc::new(Field::new("metadata", DataType::Binary, false)),
@@ -1042,13 +1076,121 @@ message schema {
             ]
             .into(),
         );
-        let error = ArrowReader::validate_unshredded_variant_storage(&shredded).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        ArrowReader::validate_variant_storage(&shredded).unwrap();
 
         let malformed =
             DataType::Struct(vec![Arc::new(Field::new("metadata", DataType::Utf8, false))].into());
-        let error = ArrowReader::validate_unshredded_variant_storage(&malformed).unwrap_err();
+        let error = ArrowReader::validate_variant_storage(&malformed).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+
+    /// A shredded file reads back as the logical Variant values, residuals included.
+    ///
+    /// The file shreds `a` (an object with `x` and `y`) and `c` from a prefix,
+    /// then holds rows whose values do not fit that layout: a string `x`, a
+    /// scalar `a`, an array, a missing field, and a null row. The reader must
+    /// return the logical `metadata`/`value` storage with every value unchanged.
+    #[tokio::test]
+    async fn variant_shredding_round_trips_nested_residuals() {
+        use parquet::variant::{json_to_variant, variant_to_json};
+
+        use crate::writer::file_writer::variant_shredding::{
+            PrefixStep, VariantPrefix, VariantShreddingPolicy,
+        };
+
+        let json = [
+            Some(r#"{"a":{"x":1,"y":"s"},"c":true}"#),
+            Some(r#"{"a":{"x":2,"y":"t"},"c":false}"#),
+            Some(r#"{"a":{"x":"not an int","y":[1,2]},"c":3}"#),
+            Some(r#"{"a":5,"b":[1,{"z":null}]}"#),
+            None,
+            Some(r#"{"c":true}"#),
+        ];
+        let input: ArrayRef = Arc::new(StringArray::from(json.to_vec()));
+        let variant = json_to_variant(&input).unwrap();
+        let mut field = variant.field("v");
+        let mut metadata = field.metadata().clone();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string());
+        field = field.with_metadata(metadata);
+        let logical = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![
+            ArrayRef::from(variant),
+        ])
+        .unwrap();
+        let prefix_rows = logical.slice(0, 2);
+        let mut prefix = VariantPrefix::new(
+            &prefix_rows.schema(),
+            VariantShreddingPolicy {
+                max_rows: 4_096,
+                max_bytes: usize::MAX,
+                min_frequency_percent: 10,
+                max_tracked_children: 1_000,
+                max_emitted_children: 300,
+                max_depth: 50,
+            },
+            RecordBatch::get_array_memory_size,
+        );
+        assert!(matches!(
+            prefix.push(&prefix_rows).unwrap(),
+            PrefixStep::Retained
+        ));
+        let layout = prefix.finish().unwrap().layout;
+        let physical = layout.shred(&logical).unwrap();
+        assert!(
+            matches!(physical.schema().field(0).data_type(), DataType::Struct(children)
+                if children.iter().any(|child| child.name() == "typed_value")),
+            "the file is shredded"
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("shredded.parquet");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&file_path).unwrap(), physical.schema(), None)
+                .unwrap();
+        writer.write(&physical).unwrap();
+        writer.close().unwrap();
+
+        let iceberg_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter([Ok(FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&file_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(file_path.to_str().unwrap().to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(iceberg_schema)
+            .with_project_field_ids(vec![1])
+            .with_case_sensitive(false)
+            .build())])) as FileScanTaskStream;
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        let read = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert!(
+            matches!(read.schema().field(0).data_type(), DataType::Struct(children)
+                if children.iter().all(|child| child.name() != "typed_value")),
+            "the reader returns logical Variant storage"
+        );
+        assert_eq!(
+            variant_to_json(read.column(0))
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            variant_to_json(logical.column(0))
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

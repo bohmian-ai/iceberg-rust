@@ -742,6 +742,7 @@ impl FileScanTaskReader {
             if project_row_id {
                 batch = synthesize_row_id_column(batch, first_row_id)?;
             }
+            batch = super::projection::unshred_variant_columns(batch)?;
             // Process the record batch (type promotion, column reordering, virtual fields, etc.)
             record_batch_transformer.process_record_batch(batch)
         });
