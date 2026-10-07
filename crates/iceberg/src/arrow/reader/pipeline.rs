@@ -26,7 +26,7 @@ use std::sync::atomic::AtomicU64;
 
 use arrow_schema::{DataType, Field};
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowFilter};
 use parquet::arrow::{
     PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
 };
@@ -34,8 +34,8 @@ use parquet::encryption::decrypt::FileDecryptionProperties;
 
 use super::row_lineage::synthesize_row_id_column;
 use super::{
-    ArrowFileReader, ArrowReader, ParquetMetadataLoader, ParquetReadOptions,
-    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    ArrowFileReader, ArrowReader, ParquetFileReadPlanner, ParquetMetadataLoader,
+    ParquetReadOptions, add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
     find_leaf_by_field_id,
 };
 use crate::arrow::build_partition_constant;
@@ -75,6 +75,7 @@ impl ArrowReader {
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
             metadata_loader: self.metadata_loader,
+            file_read_planner: self.file_read_planner,
         };
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
@@ -130,12 +131,14 @@ struct FileScanTaskReader {
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
     metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
+    file_read_planner: Option<Arc<dyn ParquetFileReadPlanner>>,
 }
 
 impl FileScanTaskReader {
     async fn process(self, task: FileScanTask) -> Result<ArrowRecordBatchStream> {
-        let should_load_page_index =
-            (self.row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
+        let should_load_page_index = (self.row_selection_enabled && task.predicate.is_some())
+            || !task.deletes.is_empty()
+            || self.file_read_planner.is_some();
         let mut parquet_read_options = self.parquet_read_options;
         parquet_read_options.preload_page_index = should_load_page_index;
 
@@ -169,6 +172,10 @@ impl FileScanTaskReader {
                     .await?
                 }
             };
+
+        // The planner sees the file's own footer-derived schema, before any
+        // field-id assignment, INT96 coercion, or virtual column below.
+        let file_metadata = arrow_metadata.clone();
 
         // Check if Parquet file has embedded field IDs
         // Corresponds to Java's ParquetSchemaUtil.hasIds()
@@ -600,6 +607,7 @@ impl FileScanTaskReader {
         // by using a `RowSelection`.
         let mut selected_row_group_indices = None;
         let mut row_selection = None;
+        let mut row_filter: Option<RowFilter> = None;
 
         // Filter row groups based on byte range from task.start and task.length.
         // If both start and length are 0, read the entire file (backwards compatibility).
@@ -612,6 +620,8 @@ impl FileScanTaskReader {
             selected_row_group_indices = Some(byte_range_filtered_row_groups);
         }
 
+        let final_predicate_absent = final_predicate.is_none();
+        let mut page_predicate = None;
         if let Some(predicate) = final_predicate {
             let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
@@ -620,13 +630,12 @@ impl FileScanTaskReader {
                 use_position_fallback,
             )?;
 
-            let row_filter = ArrowReader::get_row_filter(
+            row_filter = Some(ArrowReader::get_row_filter(
                 &predicate,
                 record_batch_stream_builder.parquet_schema(),
                 &iceberg_field_ids,
                 &field_id_map,
-            )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+            )?);
 
             // Row groups in this task's byte range are the ones predicate pruning
             // considers; each pruning mechanism below only sees the survivors of the
@@ -685,18 +694,63 @@ impl FileScanTaskReader {
             }
 
             if self.row_selection_enabled {
-                row_selection = ArrowReader::get_row_selection_for_filter_predicate(
-                    &predicate,
-                    record_batch_stream_builder.metadata(),
-                    &selected_row_group_indices,
-                    &field_id_map,
-                    &task.schema,
-                )?;
-                if let Some(page_index_selection) = &row_selection {
-                    self.scan_metrics
-                        .record_rows_pruned_by_page_index(page_index_selection.skipped_row_count());
-                }
+                page_predicate = Some((predicate, field_id_map));
             }
+        }
+
+        // The embedder's planner narrows what the reader's own pruning kept.
+        // It runs before page selection and deletes so both are built over
+        // the final row groups. Groups it drops count as statistics pruning.
+        let mut planned_selection = None;
+        if let Some(planner) = &self.file_read_planner {
+            let offered = selected_row_group_indices.clone().unwrap_or_else(|| {
+                (0..record_batch_stream_builder.metadata().num_row_groups()).collect()
+            });
+            if final_predicate_absent {
+                self.scan_metrics
+                    .record_row_groups_considered(offered.len());
+            }
+            let offered_count = offered.len();
+            let narrowing = planner.plan(&file_metadata, offered)?;
+            self.scan_metrics.record_row_groups_pruned_by_statistics(
+                offered_count.saturating_sub(narrowing.row_groups.len()),
+            );
+            if let Some(selection) = &narrowing.row_selection {
+                self.scan_metrics
+                    .record_rows_pruned_by_page_index(selection.skipped_row_count());
+            }
+            selected_row_group_indices = Some(narrowing.row_groups);
+            planned_selection = narrowing.row_selection;
+            row_filter = match (row_filter, narrowing.row_filter) {
+                (Some(own), Some(planned)) => Some(RowFilter::new(
+                    own.into_predicates()
+                        .into_iter()
+                        .chain(planned.into_predicates())
+                        .collect(),
+                )),
+                (own, planned) => own.or(planned),
+            };
+        }
+
+        if let Some((predicate, field_id_map)) = page_predicate {
+            row_selection = ArrowReader::get_row_selection_for_filter_predicate(
+                &predicate,
+                record_batch_stream_builder.metadata(),
+                &selected_row_group_indices,
+                &field_id_map,
+                &task.schema,
+            )?;
+            if let Some(page_index_selection) = &row_selection {
+                self.scan_metrics
+                    .record_rows_pruned_by_page_index(page_index_selection.skipped_row_count());
+            }
+        }
+        row_selection = match (row_selection, planned_selection) {
+            (Some(own), Some(planned)) => Some(own.intersection(&planned)),
+            (own, planned) => own.or(planned),
+        };
+        if let Some(row_filter) = row_filter {
+            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
         }
 
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);
@@ -2639,6 +2693,105 @@ mod tests {
         // Positional-delete selection reaches the reader via a different path than predicate
         // selection, so this covers it explicitly.
         assert_row_id_column(&batches, &[Some(100), Some(102)]);
+    }
+
+    /// Keeps row groups 1 and 2 and drops rows whose `id` is 4, standing in
+    /// for an embedder's own per-file pruning and decoder filter.
+    struct DropFirstGroupAndFour;
+
+    impl crate::arrow::ParquetFileReadPlanner for DropFirstGroupAndFour {
+        fn plan(
+            &self,
+            metadata: &parquet::arrow::arrow_reader::ArrowReaderMetadata,
+            row_groups: Vec<usize>,
+        ) -> crate::Result<crate::arrow::ParquetFileReadNarrowing> {
+            use parquet::arrow::ProjectionMask;
+            use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+
+            assert_eq!(row_groups, vec![0, 1, 2]);
+            let mask = ProjectionMask::roots(metadata.parquet_schema(), [0]);
+            let not_four = ArrowPredicateFn::new(mask, |batch| {
+                arrow_ord::cmp::neq(batch.column(0), &Int32Array::new_scalar(4))
+            });
+            Ok(crate::arrow::ParquetFileReadNarrowing {
+                row_groups: vec![1, 2],
+                row_selection: None,
+                row_filter: Some(RowFilter::new(vec![Box::new(not_four)])),
+            })
+        }
+    }
+
+    /// A planner's pruning and filter compose with Iceberg positional deletes
+    /// and keep absolute row lineage.
+    #[tokio::test]
+    async fn test_file_read_planner_narrows_with_deletes_and_lineage() {
+        use crate::scan::FileScanTaskDeleteFile;
+        use crate::spec::DataContentType;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_str().unwrap();
+        // id = 1..=6 in three row groups of two rows.
+        let data_path = format!("{dir}/planner_data.parquet");
+        let field = Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "1".to_string(),
+        )]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
+            vec![1, 2, 3, 4, 5, 6],
+        ))])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&data_path).unwrap(), arrow_schema, Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        // The positional delete removes id 5 (pos 4) from a kept group.
+        let del_path = write_positional_delete(dir, "planner_del.parquet", &data_path, &[4]);
+
+        let mut task = row_id_task(data_path, Some(100));
+        task.deletes = vec![FileScanTaskDeleteFile {
+            file_path: del_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format: DataFileFormat::Parquet,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+            sequence_number: 0,
+            key_metadata: None,
+        }];
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current())
+            .with_parquet_file_read_planner(Arc::new(DropFirstGroupAndFour))
+            .build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result = reader.read(tasks).unwrap();
+        let metrics = result.metrics().clone();
+        let batches: Vec<RecordBatch> = result.stream().try_collect().await.unwrap();
+
+        // Group 0 is pruned, id 4 is filtered, id 5 is deleted: ids 3 and 6
+        // survive at absolute positions 2 and 5.
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![3, 6]);
+        assert_row_id_column(&batches, &[Some(102), Some(105)]);
+        assert_eq!(metrics.row_groups_considered(), 3);
+        assert_eq!(metrics.row_groups_pruned_by_statistics(), 1);
     }
 
     #[tokio::test]

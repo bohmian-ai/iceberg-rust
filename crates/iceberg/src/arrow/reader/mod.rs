@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowFilter, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
@@ -72,6 +73,43 @@ pub trait ParquetMetadataLoader: Send + Sync {
     fn load(&self, path: &str, size: u64) -> BoxFuture<'static, Result<Arc<ParquetMetaData>>>;
 }
 
+/// Narrows how one opened data file is decoded, beyond the reader's own pruning.
+///
+/// An embedder installs one with [`ArrowReaderBuilder::with_parquet_file_read_planner`]
+/// to prune and filter on leaves an Iceberg predicate cannot express, such as
+/// shredded Variant paths. The reader keeps every Iceberg task semantic:
+/// projection by field id, byte ranges, deletes, schema transformation,
+/// partition constants, and row lineage. The planner only removes row groups,
+/// pages, and rows; it never adds any.
+pub trait ParquetFileReadPlanner: Send + Sync {
+    /// Plans one data file from its own footer-derived metadata.
+    ///
+    /// `row_groups` are the groups the reader still reads after its byte range
+    /// and its own predicate pruning, in ascending order. The returned groups
+    /// must be an ascending subset of them, and the returned row selection must
+    /// cover exactly the returned groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be planned; the reader then fails
+    /// the task rather than read rows the planner never saw.
+    fn plan(
+        &self,
+        metadata: &ArrowReaderMetadata,
+        row_groups: Vec<usize>,
+    ) -> Result<ParquetFileReadNarrowing>;
+}
+
+/// What a [`ParquetFileReadPlanner`] decided for one data file.
+pub struct ParquetFileReadNarrowing {
+    /// Ascending subset of the offered row groups that may hold matching rows.
+    pub row_groups: Vec<usize>,
+    /// Rows to read within `row_groups`, when pages inside them were skipped.
+    pub row_selection: Option<RowSelection>,
+    /// Decoder predicates evaluated together with the reader's own row filter.
+    pub row_filter: Option<RowFilter>,
+}
+
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
@@ -83,6 +121,7 @@ pub struct ArrowReaderBuilder {
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
     metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
+    file_read_planner: Option<Arc<dyn ParquetFileReadPlanner>>,
 }
 
 impl ArrowReaderBuilder {
@@ -100,6 +139,7 @@ impl ArrowReaderBuilder {
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
             metadata_loader: None,
+            file_read_planner: None,
         }
     }
 
@@ -107,6 +147,16 @@ impl ArrowReaderBuilder {
     /// each footer in the reader.
     pub fn with_parquet_metadata_loader(mut self, loader: Arc<dyn ParquetMetadataLoader>) -> Self {
         self.metadata_loader = Some(loader);
+        self
+    }
+
+    /// Narrows each data file's decode through `planner` after the reader's own
+    /// pruning. See [`ParquetFileReadPlanner`].
+    pub fn with_parquet_file_read_planner(
+        mut self,
+        planner: Arc<dyn ParquetFileReadPlanner>,
+    ) -> Self {
+        self.file_read_planner = Some(planner);
         self
     }
 
@@ -193,6 +243,7 @@ impl ArrowReaderBuilder {
             bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
             metadata_loader: self.metadata_loader,
+            file_read_planner: self.file_read_planner,
         }
     }
 }
@@ -212,4 +263,5 @@ pub struct ArrowReader {
     bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     metadata_loader: Option<Arc<dyn ParquetMetadataLoader>>,
+    file_read_planner: Option<Arc<dyn ParquetFileReadPlanner>>,
 }
