@@ -120,7 +120,7 @@ impl TableProvider for IcebergTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -136,7 +136,7 @@ impl TableProvider for IcebergTableProvider {
             table,
             None, // Always use current snapshot for catalog-backed provider
             self.schema.clone(),
-            projection.map(Vec::as_slice),
+            projection,
             filters,
             limit,
         )))
@@ -307,7 +307,7 @@ impl TableProvider for IcebergStaticTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -316,7 +316,7 @@ impl TableProvider for IcebergStaticTableProvider {
             self.table.clone(),
             self.snapshot_id,
             self.schema.clone(),
-            projection.map(Vec::as_slice),
+            projection,
             filters,
             limit,
         )))

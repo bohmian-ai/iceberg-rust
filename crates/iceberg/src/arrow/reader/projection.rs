@@ -2822,7 +2822,7 @@ message schema {
     /// default child names, read through a spec-conventional mapping. Both nested columns
     /// must come back populated rather than null-filled.
     async fn read_arrow_default_child_names_fixture() -> Vec<RecordBatch> {
-        use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+        use arrow_array::builder::{Int32Builder, MapBuilder, MapFieldNames, StringBuilder};
         use arrow_array::{Int32Array, ListArray};
         use arrow_buffer::OffsetBuffer;
 
@@ -2864,14 +2864,23 @@ message schema {
                 .unwrap(),
         );
 
-        // arrow-rs defaults: the list child is `item`, the map is `entries{keys, values}`.
+        // arrow-rs names: the list child is `item`, and the map is `entries{keys, values}`,
+        // the default before arrow-rs 60 and still present in files it wrote.
         let tags = Arc::new(ListArray::new(
             Arc::new(Field::new_list_field(DataType::Utf8, true)),
             OffsetBuffer::new(vec![0, 2, 3].into()),
             Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
             None,
         )) as ArrayRef;
-        let mut props = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        let mut props = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "entries".to_string(),
+                key: "keys".to_string(),
+                value: "values".to_string(),
+            }),
+            StringBuilder::new(),
+            Int32Builder::new(),
+        );
         props.keys().append_value("k1");
         props.values().append_value(1);
         props.append(true).unwrap();
@@ -2900,7 +2909,7 @@ message schema {
                 kv[1].name().as_str()
             ],
             ["item", "keys", "values"],
-            "fixture must exercise arrow-rs' default nested child names"
+            "fixture must exercise arrow-rs' nested child names"
         );
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
