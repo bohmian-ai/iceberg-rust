@@ -960,7 +960,7 @@ impl RecordBatchTransformer {
                     ColumnSource::Promote {
                         target_type,
                         source_index,
-                    } => cast(&*columns[*source_index], target_type)?,
+                    } => Self::promote(&columns[*source_index], target_type)?,
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
@@ -1049,6 +1049,54 @@ impl RecordBatchTransformer {
             // Non-REE type (simple arrays for non-constant fields)
             create_primitive_array_repeated(target_type, prim_lit, num_rows)
         }
+    }
+
+    /// Promotes `source` to `target_type`.
+    ///
+    /// A struct whose children differ by name from the target's is rebuilt by
+    /// name: each child the file read is promoted, and each child it did not
+    /// read is null when nullable. A required child is only missing when a
+    /// [`ParquetFileReadNarrowing::projection`](crate::arrow::ParquetFileReadNarrowing)
+    /// skipped it, since a required field cannot be added without a default;
+    /// that child holds zeroed values the narrowing's caller never reads.
+    /// Everything else is an Arrow cast.
+    fn promote(source: &ArrayRef, target_type: &DataType) -> Result<ArrayRef> {
+        let (DataType::Struct(read), DataType::Struct(target)) = (source.data_type(), target_type)
+        else {
+            return Ok(cast(source, target_type)?);
+        };
+        if read.len() == target.len()
+            && read
+                .iter()
+                .zip(target.iter())
+                .all(|(read, target)| read.name() == target.name())
+        {
+            return Ok(cast(source, target_type)?);
+        }
+        let source = source
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("a Struct-typed array is a StructArray");
+        let children = target
+            .iter()
+            .map(|field| match source.column_by_name(field.name()) {
+                Some(child) => Self::promote(child, field.data_type()),
+                None => {
+                    let nulls = arrow_array::new_null_array(field.data_type(), source.len());
+                    if field.is_nullable() {
+                        return Ok(nulls);
+                    }
+                    Ok(arrow_array::make_array(
+                        nulls.into_data().into_builder().nulls(None).build()?,
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(StructArray::try_new(
+            target.clone(),
+            children,
+            source.nulls().cloned(),
+        )?))
     }
 
     fn create_struct_column(
@@ -1262,6 +1310,82 @@ mod test {
         let expected = expected_record_batch_migration_required();
 
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn struct_missing_children_are_rebuilt_by_name() {
+        // A narrowed read decodes only `s.b`; the table's `s` also has a
+        // required `a` and an optional `c`. The read child keeps its values
+        // and the struct its nulls; `c` is null and `a` is an unread stand-in.
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(
+                        1,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::required(2, "a", Type::Primitive(PrimitiveType::Long))
+                                .into(),
+                            NestedField::optional(3, "b", Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            NestedField::optional(4, "c", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1]).build();
+
+        let read_fields =
+            arrow_schema::Fields::from(vec![field_with_id("b", DataType::Utf8, true, 3)]);
+        let read = StructArray::try_new(
+            read_fields.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                Some("x"),
+                None,
+                Some("z"),
+            ]))],
+            Some(vec![true, false, true].into()),
+        )
+        .unwrap();
+        let file_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "s",
+            DataType::Struct(read_fields),
+            true,
+            1,
+        )]));
+        let file_batch = RecordBatch::try_new(file_schema, vec![Arc::new(read)]).unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+
+        let s = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            s.fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!((0..3).map(|row| s.is_valid(row)).collect::<Vec<_>>(), [
+            true, false, true
+        ]);
+        let b = s
+            .column_by_name("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!((b.value(0), b.value(2)), ("x", "z"));
+        assert_eq!(s.column_by_name("c").unwrap().null_count(), 3);
+        assert_eq!(s.column_by_name("a").unwrap().null_count(), 0);
     }
 
     #[test]

@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowFilter, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
 
@@ -108,6 +109,10 @@ pub struct ParquetFileReadNarrowing {
     pub row_selection: Option<RowSelection>,
     /// Decoder predicates evaluated together with the reader's own row filter.
     pub row_filter: Option<RowFilter>,
+    /// Leaves to decode, intersected with the reader's own projection, so a
+    /// query that uses only some fields of a nested column skips the rest.
+    /// `None` keeps the reader's projection.
+    pub projection: Option<ProjectionMask>,
 }
 
 /// Builder to create ArrowReader

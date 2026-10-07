@@ -414,14 +414,13 @@ impl FileScanTaskReader {
         // reserved field ids are not in the task schema, so they can't be requested through
         // `get_arrow_projection_mask` (which resolves ids against the task schema); add
         // their Parquet leaves directly.
-        for leaf in [coalesce_last_updated_seq_leaf, coalesce_row_id_leaf]
-            .into_iter()
-            .flatten()
-        {
-            let phys_mask =
-                ProjectionMask::leaves(record_batch_stream_builder.parquet_schema(), vec![leaf]);
-            projection_mask.union(&phys_mask);
-        }
+        let metadata_leaves = ProjectionMask::leaves(
+            record_batch_stream_builder.parquet_schema(),
+            [coalesce_last_updated_seq_leaf, coalesce_row_id_leaf]
+                .into_iter()
+                .flatten(),
+        );
+        projection_mask.union(&metadata_leaves);
 
         record_batch_stream_builder =
             record_batch_stream_builder.with_projection(projection_mask.clone());
@@ -721,6 +720,14 @@ impl FileScanTaskReader {
             }
             selected_row_group_indices = Some(narrowing.row_groups);
             planned_selection = narrowing.row_selection;
+            // The planner may decode fewer leaves of the columns it reads; the
+            // metadata leaves above are the reader's own and stay read.
+            if let Some(planned) = &narrowing.projection {
+                projection_mask.intersect(planned);
+                projection_mask.union(&metadata_leaves);
+                record_batch_stream_builder =
+                    record_batch_stream_builder.with_projection(projection_mask.clone());
+            }
             row_filter = match (row_filter, narrowing.row_filter) {
                 (Some(own), Some(planned)) => Some(RowFilter::new(
                     own.into_predicates()
@@ -2695,8 +2702,9 @@ mod tests {
         assert_row_id_column(&batches, &[Some(100), Some(102)]);
     }
 
-    /// Keeps row groups 1 and 2 and drops rows whose `id` is 4, standing in
-    /// for an embedder's own per-file pruning and decoder filter.
+    /// Keeps row groups 1 and 2, drops rows whose `id` is 4, and projects
+    /// `id`, standing in for an embedder's own per-file pruning, decoder
+    /// filter, and leaf projection.
     struct DropFirstGroupAndFour;
 
     impl crate::arrow::ParquetFileReadPlanner for DropFirstGroupAndFour {
@@ -2710,19 +2718,20 @@ mod tests {
 
             assert_eq!(row_groups, vec![0, 1, 2]);
             let mask = ProjectionMask::roots(metadata.parquet_schema(), [0]);
-            let not_four = ArrowPredicateFn::new(mask, |batch| {
+            let not_four = ArrowPredicateFn::new(mask.clone(), |batch| {
                 arrow_ord::cmp::neq(batch.column(0), &Int32Array::new_scalar(4))
             });
             Ok(crate::arrow::ParquetFileReadNarrowing {
                 row_groups: vec![1, 2],
                 row_selection: None,
                 row_filter: Some(RowFilter::new(vec![Box::new(not_four)])),
+                projection: Some(mask),
             })
         }
     }
 
-    /// A planner's pruning and filter compose with Iceberg positional deletes
-    /// and keep absolute row lineage.
+    /// A planner's pruning, filter, and projection compose with Iceberg
+    /// positional deletes and keep absolute row lineage.
     #[tokio::test]
     async fn test_file_read_planner_narrows_with_deletes_and_lineage() {
         use crate::scan::FileScanTaskDeleteFile;
