@@ -205,10 +205,10 @@ mod tests {
         let positional_delete_schema = create_pos_del_schema();
         let file_path_col = Arc::new(StringArray::from_iter_values(vec!["data.parquet"; 4]));
         let pos_col = Arc::new(Int64Array::from(vec![0i64, 1, 5, 10]));
-        let batch = RecordBatch::try_new(
-            positional_delete_schema.clone(),
-            vec![file_path_col, pos_col],
-        )
+        let batch = RecordBatch::try_new(positional_delete_schema.clone(), vec![
+            file_path_col,
+            pos_col,
+        ])
         .unwrap();
 
         let del_path = format!("{table_location}/encrypted-pos-del.parquet");

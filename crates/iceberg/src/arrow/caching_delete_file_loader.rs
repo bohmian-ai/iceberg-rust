@@ -908,11 +908,11 @@ mod tests {
             true,
             "3",
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec![Some("INACTIVE")])) as ArrayRef],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![
+                Arc::new(StringArray::from(vec![Some("INACTIVE")])) as ArrayRef,
+            ])
+            .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
         let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
@@ -938,10 +938,9 @@ mod tests {
             true,
             "3",
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef],
-        )
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![
+            None as Option<&str>,
+        ])) as ArrayRef])
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
@@ -963,13 +962,10 @@ mod tests {
             simple_field("id", DataType::Int64, true, "1"),
             simple_field("status", DataType::Utf8, true, "3"),
         ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("X")])) as ArrayRef,
-            ],
-        )
+        let batch = RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("X")])) as ArrayRef,
+        ])
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
@@ -996,10 +992,10 @@ mod tests {
             true,
             "3",
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec![Some("A"), Some("B")])) as ArrayRef],
-        )
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![
+            Some("A"),
+            Some("B"),
+        ])) as ArrayRef])
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
@@ -1181,10 +1177,9 @@ mod tests {
             Arc::new(arrow_schema::Schema::new(fields))
         };
 
-        let equality_deletes_to_write = RecordBatch::try_new(
-            equality_delete_schema.clone(),
-            vec![col_y, col_z, col_a, col_s, col_b],
-        )
+        let equality_deletes_to_write = RecordBatch::try_new(equality_delete_schema.clone(), vec![
+            col_y, col_z, col_a, col_s, col_b,
+        ])
         .unwrap();
 
         let path = format!("{}/equality-deletes-1.parquet", &table_location);
@@ -1303,10 +1298,9 @@ mod tests {
         let first = filter.get_delete_vector_for_path("data-a.parquet").unwrap();
         let second = filter.get_delete_vector_for_path("data-b.parquet").unwrap();
         assert_eq!(first.lock().unwrap().iter().collect::<Vec<_>>(), vec![1, 3]);
-        assert_eq!(
-            second.lock().unwrap().iter().collect::<Vec<_>>(),
-            vec![2, 8]
-        );
+        assert_eq!(second.lock().unwrap().iter().collect::<Vec<_>>(), vec![
+            2, 8
+        ]);
     }
 
     #[tokio::test]
@@ -1510,11 +1504,12 @@ mod tests {
         let file_path_col = Arc::new(StringArray::from_iter_values(&file_path_values));
         let pos_col = Arc::new(Int64Array::from_iter_values(vec![0i64, 1, 2, 3]));
 
-        let positional_deletes_to_write = RecordBatch::try_new(
-            positional_delete_schema.clone(),
-            vec![file_path_col, pos_col],
-        )
-        .unwrap();
+        let positional_deletes_to_write =
+            RecordBatch::try_new(positional_delete_schema.clone(), vec![
+                file_path_col,
+                pos_col,
+            ])
+            .unwrap();
 
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)

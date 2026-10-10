@@ -1336,13 +1336,10 @@ mod tests {
         let mut rows = vec![Some(r#"{"a":1}"#)];
         rows.extend(std::iter::repeat_n(Some(r#"{"b":1}"#), 11));
         rows.extend(std::iter::repeat_n(None, 5));
-        assert_eq!(
-            infer(&rows),
-            [
-                ("a".to_string(), DataType::Int8),
-                ("b".to_string(), DataType::Int8)
-            ]
-        );
+        assert_eq!(infer(&rows), [
+            ("a".to_string(), DataType::Int8),
+            ("b".to_string(), DataType::Int8)
+        ]);
         rows.push(Some(r#"{"b":2}"#));
         assert_eq!(infer(&rows), [("b".to_string(), DataType::Int8)]);
     }
@@ -1438,10 +1435,9 @@ mod tests {
                 weight: 1.0,
             },
         ];
-        assert_eq!(
-            names(node.shredding_type(&rules, &policy).as_ref()),
-            ["x", "y"]
-        );
+        assert_eq!(names(node.shredding_type(&rules, &policy).as_ref()), [
+            "x", "y"
+        ]);
     }
 
     /// Integers and decimals widen within their family; mixed families, containers, and arrays stay residual.
@@ -1471,10 +1467,9 @@ mod tests {
             .with_field("d", VariantDecimal8::try_new(1_234_567_890_123, 3).unwrap())
             .finish();
         let variant = builder.build();
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![variant.field("v")])),
-            vec![variant.into()],
-        )
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![variant.field("v")])), vec![
+            variant.into(),
+        ])
         .unwrap();
         assert_eq!(
             shredded_fields(
@@ -1557,10 +1552,11 @@ mod tests {
         .unwrap()
         .into();
         let json = parquet::variant::variant_to_json(&logical).unwrap();
-        assert_eq!(
-            json.iter().collect::<Vec<_>>(),
-            [Some(r#"{"a":"text"}"#), Some(r#"{"a":[1,2]}"#), None]
-        );
+        assert_eq!(json.iter().collect::<Vec<_>>(), [
+            Some(r#"{"a":"text"}"#),
+            Some(r#"{"a":[1,2]}"#),
+            None
+        ]);
     }
 
     /// A batch with one `events: List<Struct<name, attributes: Variant>>`
@@ -1645,17 +1641,14 @@ mod tests {
                 .unwrap();
         let descr = footer.file_metadata().schema_descr();
         let at = |leaf: usize| descr.column(leaf).path().string();
-        assert_eq!(
-            leaves.all.clone().map(at).collect::<Vec<_>>(),
-            [
-                "events.list.element.attributes.metadata",
-                "events.list.element.attributes.value",
-                "events.list.element.attributes.typed_value.rare.value",
-                "events.list.element.attributes.typed_value.rare.typed_value",
-                "events.list.element.attributes.typed_value.s.value",
-                "events.list.element.attributes.typed_value.s.typed_value",
-            ]
-        );
+        assert_eq!(leaves.all.clone().map(at).collect::<Vec<_>>(), [
+            "events.list.element.attributes.metadata",
+            "events.list.element.attributes.value",
+            "events.list.element.attributes.typed_value.rare.value",
+            "events.list.element.attributes.typed_value.rare.typed_value",
+            "events.list.element.attributes.typed_value.s.value",
+            "events.list.element.attributes.typed_value.s.typed_value",
+        ]);
         assert_eq!(
             leaves.metadata.map(at).unwrap(),
             "events.list.element.attributes.metadata"
@@ -1700,10 +1693,10 @@ mod tests {
         ];
         let schema = variant_batch(&[None]).schema();
         let layout = VariantLayout::combine(&schema, &footers, &POLICY).unwrap();
-        assert_eq!(
-            shredded_fields(layout.shredding_type(&["v"]).cloned()),
-            [("x".to_string(), DataType::Utf8)]
-        );
+        assert_eq!(shredded_fields(layout.shredding_type(&["v"]).cloned()), [(
+            "x".to_string(),
+            DataType::Utf8
+        )]);
         assert!(
             VariantLayout::combine(&schema, &[], &POLICY)
                 .unwrap()

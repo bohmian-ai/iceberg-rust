@@ -35,8 +35,7 @@ use crate::writer::{DefaultInput, DefaultOutput, PositionDeleteInput};
 /// closing the writer to retrieve the output.
 #[async_trait::async_trait]
 pub trait PartitioningWriter<I = DefaultInput, O = DefaultOutput>: Send + 'static
-where
-    I: Send + 'static,
+where I: Send + 'static
 {
     /// Write data with a partition key.
     ///

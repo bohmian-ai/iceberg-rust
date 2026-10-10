@@ -785,10 +785,9 @@ mod tests {
         let values = vec![Some(1.0f32), Some(f32::NAN), None, Some(0.0f32)];
 
         // is_nan: non-null-propagating per Java's implementation - NULL → false
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Float32Array::from(values.clone()))],
-        )
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Float32Array::from(
+            values.clone(),
+        ))])
         .unwrap();
         let result =
             apply_predicate_to_batch(Reference::new("qux").is_nan(), schema.clone(), batch);

@@ -323,9 +323,7 @@ impl UpdateMetrics {
 }
 
 fn set_if_positive<T>(properties: &mut HashMap<String, String>, value: T, property_name: &str)
-where
-    T: PartialOrd + Default + ToString,
-{
+where T: PartialOrd + Default + ToString {
     if value > T::default() {
         properties.insert(property_name.to_string(), value.to_string());
     }
@@ -1324,25 +1322,19 @@ mod tests {
         // compaction removed 255 files. The old arithmetic committed
         // `2 + 31 - 255` as total-data-files=18446744073709551394, and
         // `18282 + 3320626 - 14296637` as total-files-size=18446744073698593887.
-        let previous_summary = summary_with(
-            Operation::Append,
-            &[
-                (TOTAL_DATA_FILES, "2"),
-                (TOTAL_RECORDS, "5"),
-                (TOTAL_FILE_SIZE, "18282"),
-            ],
-        );
-        let summary = summary_with(
-            Operation::Replace,
-            &[
-                (ADDED_DATA_FILES, "31"),
-                (DELETED_DATA_FILES, "255"),
-                (ADDED_RECORDS, "90575"),
-                (DELETED_RECORDS, "90575"),
-                (ADDED_FILE_SIZE, "3320626"),
-                (REMOVED_FILE_SIZE, "14296637"),
-            ],
-        );
+        let previous_summary = summary_with(Operation::Append, &[
+            (TOTAL_DATA_FILES, "2"),
+            (TOTAL_RECORDS, "5"),
+            (TOTAL_FILE_SIZE, "18282"),
+        ]);
+        let summary = summary_with(Operation::Replace, &[
+            (ADDED_DATA_FILES, "31"),
+            (DELETED_DATA_FILES, "255"),
+            (ADDED_RECORDS, "90575"),
+            (DELETED_RECORDS, "90575"),
+            (ADDED_FILE_SIZE, "3320626"),
+            (REMOVED_FILE_SIZE, "14296637"),
+        ]);
 
         let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
         let props = &updated.additional_properties;
@@ -1366,14 +1358,14 @@ mod tests {
     #[test]
     fn test_update_totals_written_when_removals_exactly_cancel_previous_total() {
         // Zero is a real total (the commit removed everything), not an underflow.
-        let previous_summary = summary_with(
-            Operation::Append,
-            &[(TOTAL_DATA_FILES, "10"), (TOTAL_RECORDS, "100")],
-        );
-        let summary = summary_with(
-            Operation::Delete,
-            &[(DELETED_DATA_FILES, "10"), (DELETED_RECORDS, "100")],
-        );
+        let previous_summary = summary_with(Operation::Append, &[
+            (TOTAL_DATA_FILES, "10"),
+            (TOTAL_RECORDS, "100"),
+        ]);
+        let summary = summary_with(Operation::Delete, &[
+            (DELETED_DATA_FILES, "10"),
+            (DELETED_RECORDS, "100"),
+        ]);
 
         let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
         let props = &updated.additional_properties;
@@ -1387,17 +1379,14 @@ mod tests {
         // Snapshots committed before this fix can carry wrapped totals near
         // u64::MAX. Rolling one forward would copy it into every later commit,
         // and iceberg-java cannot parse it anyway. Treat it as unknown.
-        let previous_summary = summary_with(
-            Operation::Replace,
-            &[
-                (TOTAL_DATA_FILES, "18446744073709551394"),
-                (TOTAL_RECORDS, "5"),
-            ],
-        );
-        let summary = summary_with(
-            Operation::Append,
-            &[(ADDED_DATA_FILES, "1"), (ADDED_RECORDS, "83")],
-        );
+        let previous_summary = summary_with(Operation::Replace, &[
+            (TOTAL_DATA_FILES, "18446744073709551394"),
+            (TOTAL_RECORDS, "5"),
+        ]);
+        let summary = summary_with(Operation::Append, &[
+            (ADDED_DATA_FILES, "1"),
+            (ADDED_RECORDS, "83"),
+        ]);
 
         let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
         let props = &updated.additional_properties;
@@ -1413,17 +1402,14 @@ mod tests {
     fn test_update_totals_bounded_by_i64_max() {
         let max = i64::MAX.to_string();
         let max_minus_one = (i64::MAX - 1).to_string();
-        let previous_summary = summary_with(
-            Operation::Append,
-            &[
-                (TOTAL_RECORDS, max.as_str()),
-                (TOTAL_FILE_SIZE, max_minus_one.as_str()),
-            ],
-        );
-        let summary = summary_with(
-            Operation::Append,
-            &[(ADDED_RECORDS, "1"), (ADDED_FILE_SIZE, "1")],
-        );
+        let previous_summary = summary_with(Operation::Append, &[
+            (TOTAL_RECORDS, max.as_str()),
+            (TOTAL_FILE_SIZE, max_minus_one.as_str()),
+        ]);
+        let summary = summary_with(Operation::Append, &[
+            (ADDED_RECORDS, "1"),
+            (ADDED_FILE_SIZE, "1"),
+        ]);
 
         let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
         let props = &updated.additional_properties;

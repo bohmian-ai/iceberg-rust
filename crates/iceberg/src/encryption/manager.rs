@@ -236,9 +236,7 @@ impl EncryptionManager {
     /// Use at commit time to persist newly created KEKs and wrapped
     /// manifest-list entries into `TableMetadata.encryption_keys`.
     pub fn with_encryption_keys<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&HashMap<String, EncryptedKey>) -> R,
-    {
+    where F: FnOnce(&HashMap<String, EncryptedKey>) -> R {
         let keys = self
             .encryption_keys
             .read()

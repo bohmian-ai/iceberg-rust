@@ -1420,10 +1420,10 @@ mod tests {
         input_opens.store(0, Ordering::SeqCst);
 
         let filtered = manager
-            .filter_manifests(
-                &schema,
-                vec![input_manifest.clone(), input_manifest.clone()],
-            )
+            .filter_manifests(&schema, vec![
+                input_manifest.clone(),
+                input_manifest.clone(),
+            ])
             .await
             .unwrap();
 

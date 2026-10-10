@@ -887,13 +887,10 @@ mod tests {
         string_vals.push(Some("BISON".to_string()));
 
         batches.push(
-            RecordBatch::try_new(
-                arrow_schema.clone(),
-                vec![
-                    Arc::new(Float32Array::from(float_vals)),
-                    Arc::new(StringArray::from(string_vals)),
-                ],
-            )
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Float32Array::from(float_vals)),
+                Arc::new(StringArray::from(string_vals)),
+            ])
             .unwrap(),
         );
 
@@ -902,13 +899,10 @@ mod tests {
         let string_vals = vec![Some("DEER".to_string()); 1024];
 
         batches.push(
-            RecordBatch::try_new(
-                arrow_schema.clone(),
-                vec![
-                    Arc::new(Float32Array::from(float_vals)),
-                    Arc::new(StringArray::from(string_vals)),
-                ],
-            )
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Float32Array::from(float_vals)),
+                Arc::new(StringArray::from(string_vals)),
+            ])
             .unwrap(),
         );
 
@@ -925,13 +919,10 @@ mod tests {
         }
 
         batches.push(
-            RecordBatch::try_new(
-                arrow_schema.clone(),
-                vec![
-                    Arc::new(Float32Array::from(float_vals)),
-                    Arc::new(StringArray::from(string_vals)),
-                ],
-            )
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Float32Array::from(float_vals)),
+                Arc::new(StringArray::from(string_vals)),
+            ])
             .unwrap(),
         );
 
@@ -943,13 +934,10 @@ mod tests {
         let string_vals = vec![Some("HIPPO".to_string()); 1024];
 
         batches.push(
-            RecordBatch::try_new(
-                arrow_schema.clone(),
-                vec![
-                    Arc::new(Float32Array::from(float_vals)),
-                    Arc::new(StringArray::from(string_vals)),
-                ],
-            )
+            RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Float32Array::from(float_vals)),
+                Arc::new(StringArray::from(string_vals)),
+            ])
             .unwrap(),
         );
 
@@ -1481,14 +1469,11 @@ mod tests {
             let timestamps: Vec<i64> = (0..BINARY_PAGE_ROWS)
                 .map(|row| (page * 1_000_000 + row) as i64)
                 .collect();
-            let batch = RecordBatch::try_new(
-                arrow_schema.clone(),
-                vec![
-                    Arc::new(FixedSizeBinaryArray::try_from_iter(ids.into_iter()).unwrap()),
-                    Arc::new(BinaryArray::from_iter_values(payloads)),
-                    Arc::new(TimestampMicrosecondArray::from(timestamps)),
-                ],
-            )
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(FixedSizeBinaryArray::try_from_iter(ids.into_iter()).unwrap()),
+                Arc::new(BinaryArray::from_iter_values(payloads)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            ])
             .unwrap();
             // Write rows one at a time so the writer honours the page row limit.
             for row in 0..batch.num_rows() {

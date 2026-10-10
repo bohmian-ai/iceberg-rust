@@ -649,12 +649,9 @@ mod tests {
 
         // Verify requirement.
         assert_eq!(requirements.len(), 1);
-        assert_eq!(
-            requirements[0],
-            TableRequirement::CurrentSchemaIdMatch {
-                current_schema_id: table.metadata().current_schema().schema_id()
-            }
-        );
+        assert_eq!(requirements[0], TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: table.metadata().current_schema().schema_id()
+        });
     }
 
     #[tokio::test]

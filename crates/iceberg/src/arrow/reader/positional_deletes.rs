@@ -369,16 +369,14 @@ mod tests {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
-        )
+        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(1..=100),
+        )])
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
-        )
+        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(101..=200),
+        )])
         .unwrap();
 
         // Force each batch into its own row group
@@ -417,13 +415,10 @@ mod tests {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(
-            delete_schema.clone(),
-            vec![
-                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-                Arc::new(Int64Array::from_iter_values(vec![199i64])),
-            ],
-        )
+        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+            Arc::new(Int64Array::from_iter_values(vec![199i64])),
+        ])
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -568,16 +563,14 @@ mod tests {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
-        )
+        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(1..=100),
+        )])
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
-        )
+        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(101..=200),
+        )])
         .unwrap();
 
         // Force each batch into its own row group
@@ -616,13 +609,10 @@ mod tests {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(
-            delete_schema.clone(),
-            vec![
-                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-                Arc::new(Int64Array::from_iter_values(vec![199i64])),
-            ],
-        )
+        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+            Arc::new(Int64Array::from_iter_values(vec![199i64])),
+        ])
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -796,16 +786,14 @@ mod tests {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
-        )
+        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(1..=100),
+        )])
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
-        )
+        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(101..=200),
+        )])
         .unwrap();
 
         // Force each batch into its own row group
@@ -844,13 +832,10 @@ mod tests {
         ]));
 
         // Delete row at position 0 (0-indexed, so it's the first row: id=1)
-        let delete_batch = RecordBatch::try_new(
-            delete_schema.clone(),
-            vec![
-                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-                Arc::new(Int64Array::from_iter_values(vec![0i64])),
-            ],
-        )
+        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+            Arc::new(Int64Array::from_iter_values(vec![0i64])),
+        ])
         .unwrap();
 
         let delete_props = WriterProperties::builder()

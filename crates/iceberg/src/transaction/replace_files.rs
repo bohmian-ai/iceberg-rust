@@ -1180,14 +1180,12 @@ mod tests {
         let retained = retry_test_data_file("test/retained.parquet");
         let replacement = retry_test_data_file("test/replacement.parquet");
         let original_manifest_path = "memory:///test/location/metadata/original.avro";
-        let original_manifest = write_retry_test_manifest(
-            &base,
-            original_manifest_path,
-            101,
-            1,
-            vec![removed.clone(), retained],
-        )
-        .await;
+        let original_manifest =
+            write_retry_test_manifest(&base, original_manifest_path, 101, 1, vec![
+                removed.clone(),
+                retained,
+            ])
+            .await;
         let snapshot = write_retry_test_snapshot(
             &base,
             "memory:///test/location/metadata/list-101.avro",
@@ -1473,24 +1471,18 @@ mod tests {
         let removed = retry_test_data_file("test/fused-removed.parquet");
         let retained = retry_test_data_file("test/fused-retained.parquet");
         let manifest_path = "memory:///test/location/metadata/fused-source.avro";
-        let manifest = write_retry_test_manifest(
-            &base,
-            manifest_path,
-            112,
-            1,
-            vec![removed.clone(), retained],
-        )
+        let manifest = write_retry_test_manifest(&base, manifest_path, 112, 1, vec![
+            removed.clone(),
+            retained,
+        ])
         .await;
         let unaffected_manifest_path =
             "memory:///test/location/metadata/fused-unaffected-source.avro";
-        let unaffected_manifest = write_retry_test_manifest(
-            &base,
-            unaffected_manifest_path,
-            112,
-            1,
-            vec![retry_test_data_file("test/fused-unaffected.parquet")],
-        )
-        .await;
+        let unaffected_manifest =
+            write_retry_test_manifest(&base, unaffected_manifest_path, 112, 1, vec![
+                retry_test_data_file("test/fused-unaffected.parquet"),
+            ])
+            .await;
         let snapshot = write_retry_test_snapshot(
             &base,
             "memory:///test/location/metadata/fused-list.avro",
@@ -1550,14 +1542,12 @@ mod tests {
         let retained = retry_test_data_file("test/transaction-retained.parquet");
         let replacement = retry_test_data_file("test/transaction-replacement.parquet");
         let original_manifest_path = "memory:///test/location/metadata/transaction-original.avro";
-        let original_manifest = write_retry_test_manifest(
-            &base,
-            original_manifest_path,
-            301,
-            1,
-            vec![removed.clone(), retained],
-        )
-        .await;
+        let original_manifest =
+            write_retry_test_manifest(&base, original_manifest_path, 301, 1, vec![
+                removed.clone(),
+                retained,
+            ])
+            .await;
         let snapshot = write_retry_test_snapshot(
             &base,
             "memory:///test/location/metadata/list-301.avro",
@@ -2262,10 +2252,10 @@ mod tests {
 
         let state = action.state.lock().unwrap();
         let prepared = state.prepared.as_ref().unwrap();
-        assert_eq!(
-            prepared.source_manifests,
-            vec![data_manifest, appended_manifest]
-        );
+        assert_eq!(prepared.source_manifests, vec![
+            data_manifest,
+            appended_manifest
+        ]);
         assert!(
             prepared
                 .output_manifests
@@ -2589,13 +2579,10 @@ mod tests {
         }
         entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
 
-        assert_eq!(
-            entries,
-            vec![
-                (REMOVED_DELETE_FILE.to_string(), ManifestStatus::Deleted),
-                (RETAINED_DELETE_FILE.to_string(), ManifestStatus::Existing),
-            ]
-        );
+        assert_eq!(entries, vec![
+            (REMOVED_DELETE_FILE.to_string(), ManifestStatus::Deleted),
+            (RETAINED_DELETE_FILE.to_string(), ManifestStatus::Existing),
+        ]);
     }
 
     #[tokio::test]
@@ -2905,19 +2892,16 @@ mod tests {
             );
         }
         statuses.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        assert_eq!(
-            statuses,
-            vec![
-                (
-                    "test/old-spec-removed.parquet".to_string(),
-                    ManifestStatus::Deleted,
-                ),
-                (
-                    "test/old-spec-survivor.parquet".to_string(),
-                    ManifestStatus::Existing,
-                ),
-            ]
-        );
+        assert_eq!(statuses, vec![
+            (
+                "test/old-spec-removed.parquet".to_string(),
+                ManifestStatus::Deleted,
+            ),
+            (
+                "test/old-spec-survivor.parquet".to_string(),
+                ManifestStatus::Existing,
+            ),
+        ]);
     }
 
     #[tokio::test]
@@ -3006,13 +2990,10 @@ mod tests {
             &updates[1],
             TableUpdate::SetSnapshotRef { ref_name, .. } if ref_name == "staging"
         ));
-        assert_eq!(
-            requirements[1],
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: "staging".to_string(),
-                snapshot_id: Some(PARENT_SNAPSHOT_ID),
-            }
-        );
+        assert_eq!(requirements[1], TableRequirement::RefSnapshotIdMatch {
+            r#ref: "staging".to_string(),
+            snapshot_id: Some(PARENT_SNAPSHOT_ID),
+        });
     }
 
     #[tokio::test]
@@ -3275,13 +3256,10 @@ mod tests {
         }
         dv_entries.sort_unstable_by_key(|entry| entry.1);
 
-        assert_eq!(
-            dv_entries,
-            vec![
-                (Some(DATA_A.to_string()), Some(4), ManifestStatus::Deleted),
-                (Some(DATA_B.to_string()), Some(68), ManifestStatus::Existing),
-            ]
-        );
+        assert_eq!(dv_entries, vec![
+            (Some(DATA_A.to_string()), Some(4), ManifestStatus::Deleted),
+            (Some(DATA_B.to_string()), Some(68), ManifestStatus::Existing),
+        ]);
 
         let action = Transaction::new(&table)
             .rewrite_files()
@@ -3318,9 +3296,9 @@ mod tests {
         }
         offsets_and_statuses.sort_unstable_by_key(|entry| entry.0);
 
-        assert_eq!(
-            offsets_and_statuses,
-            vec![(4, ManifestStatus::Deleted), (68, ManifestStatus::Existing),]
-        );
+        assert_eq!(offsets_and_statuses, vec![
+            (4, ManifestStatus::Deleted),
+            (68, ManifestStatus::Existing),
+        ]);
     }
 }
