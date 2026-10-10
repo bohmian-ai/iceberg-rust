@@ -433,8 +433,12 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         // DataFusion's type coercion always converts them to match the column type
         // (either TimestampMicrosecond or TimestampNanosecond) before predicate pushdown.
         // See unit tests for how those conversions would work if needed.
-        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Datum::timestamp_micros(*v)),
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(Datum::timestamp_nanos(*v)),
+        // A zoned literal is an instant, so it maps to the timestamptz type a
+        // zoned column has; binding cannot convert between nanosecond types.
+        ScalarValue::TimestampMicrosecond(Some(v), None) => Some(Datum::timestamp_micros(*v)),
+        ScalarValue::TimestampMicrosecond(Some(v), Some(_)) => Some(Datum::timestamptz_micros(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), None) => Some(Datum::timestamp_nanos(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), Some(_)) => Some(Datum::timestamptz_nanos(*v)),
         _ => None,
     }
 }
@@ -670,6 +674,18 @@ mod tests {
         let datum =
             super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(Some(ts_nanos), None));
         assert_eq!(datum, Some(Datum::timestamp_nanos(ts_nanos)));
+
+        // A zoned literal maps to the timestamptz type of its precision
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(
+            Some(ts_micros),
+            Some("+00:00".into()),
+        ));
+        assert_eq!(datum, Some(Datum::timestamptz_micros(ts_micros)));
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(
+            Some(ts_nanos),
+            Some("UTC".into()),
+        ));
+        assert_eq!(datum, Some(Datum::timestamptz_nanos(ts_nanos)));
 
         // Test None timestamp
         let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(None, None));
