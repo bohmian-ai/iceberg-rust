@@ -348,6 +348,11 @@ impl TransformFunction for Hour {
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap()
                 .unary(|v| -> i32 { Self::hour_timestamp_micro(v) }),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => input
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .unary(|v| -> i32 { Self::hour_timestamp_nano(v) }),
             _ => {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
@@ -2714,6 +2719,18 @@ mod test {
         assert_eq!(res.value(2), expect_hour[2]);
         assert_eq!(res.value(3), expect_hour[3]);
         assert_eq!(res.value(4), -1);
+
+        // Test TimestampNanosecond, zoned as an instant column is
+        let nanos: ArrayRef = Arc::new(
+            arrow_array::TimestampNanosecondArray::from(vec![
+                420_042 * 3_600_000_000_000 + 1,
+                -1,
+            ])
+            .with_timezone("+00:00"),
+        );
+        let res = hour.transform(nanos).unwrap();
+        let res = res.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(res.values(), &[420_042, -1]);
     }
 
     #[test]
