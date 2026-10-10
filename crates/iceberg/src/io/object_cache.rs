@@ -401,12 +401,15 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
-                let metadata_json = render_template(&template_json_str, context! {
-                    table_location => &table_location,
-                    manifest_list_1_location => &manifest_list1_location,
-                    manifest_list_2_location => &manifest_list2_location,
-                    table_metadata_1_location => &table_metadata1_location,
-                });
+                let metadata_json = render_template(
+                    &template_json_str,
+                    context! {
+                        table_location => &table_location,
+                        manifest_list_1_location => &manifest_list1_location,
+                        manifest_list_2_location => &manifest_list2_location,
+                        table_metadata_1_location => &table_metadata1_location,
+                    },
+                );
                 serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
             };
 
@@ -610,11 +613,14 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
-        let metadata_json = render_template(&template_json, context! {
-            table_location => &table_location,
-            manifest_list_location => &manifest_list_location,
-            table_metadata_location => &table_metadata_location,
-        });
+        let metadata_json = render_template(
+            &template_json,
+            context! {
+                table_location => &table_location,
+                manifest_list_location => &manifest_list_location,
+                table_metadata_location => &table_metadata_location,
+            },
+        );
         let table = Table::builder()
             .metadata(serde_json::from_str::<TableMetadata>(&metadata_json).unwrap())
             .identifier(TableIdent::from_strs(["db", "table1"]).unwrap())

@@ -1087,9 +1087,10 @@ message schema {
         let mut metadata = field.metadata().clone();
         metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string());
         field = field.with_metadata(metadata);
-        let logical = RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![
-            ArrayRef::from(variant),
-        ])
+        let logical = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![field])),
+            vec![ArrayRef::from(variant)],
+        )
         .unwrap();
         let sampled_rows = logical.slice(0, 2);
         let mut sampler = VariantSampler::new(
@@ -1221,10 +1222,13 @@ message schema {
         variant_metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string());
         let variant_field = variant_array.field("v").with_metadata(variant_metadata);
         let arrow_schema = Arc::new(ArrowSchema::new(vec![id_field, variant_field]));
-        let batch = RecordBatch::try_new(arrow_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-            ArrayRef::from(variant_array),
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                ArrayRef::from(variant_array),
+            ],
+        )
         .unwrap();
 
         let temp_dir = TempDir::new().unwrap();
@@ -1276,10 +1280,10 @@ message schema {
             Some("arrow.parquet.variant")
         );
         let json = variant_to_json(batches[0].column(1)).unwrap();
-        assert_eq!(json.iter().collect::<Vec<_>>(), vec![
-            Some(r#""hello""#),
-            Some("42")
-        ]);
+        assert_eq!(
+            json.iter().collect::<Vec<_>>(),
+            vec![Some(r#""hello""#), Some("42")]
+        );
     }
 
     /// Test schema evolution: reading old Parquet file (with only column 'a')
@@ -1715,9 +1719,10 @@ message schema {
         let col3_data = Arc::new(StringArray::from(vec!["c", "d"])) as ArrayRef;
         let col4_data = Arc::new(Int32Array::from(vec![30, 40])) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col1_data, col2_data, col3_data, col4_data,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![col1_data, col2_data, col3_data, col4_data],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -2711,11 +2716,15 @@ message schema {
         NameMapping::new(vec![
             MappedField::new(Some(1), vec!["ingest_ts".to_string()], vec![]),
             MappedField::new(Some(2), vec!["amount".to_string()], vec![]),
-            MappedField::new(Some(4), vec!["tags".to_string()], vec![MappedField::new(
-                Some(5),
-                vec!["element".to_string()],
-                vec![],
-            )]),
+            MappedField::new(
+                Some(4),
+                vec!["tags".to_string()],
+                vec![MappedField::new(
+                    Some(5),
+                    vec!["element".to_string()],
+                    vec![],
+                )],
+            ),
         ])
     }
 
@@ -2880,19 +2889,27 @@ message schema {
         // Shaped like any mapping derived from an Iceberg schema (Java's
         // `MappingUtil.create`, or this crate's schema conversion).
         let mapping = NameMapping::new(vec![
-            MappedField::new(Some(1), vec!["tags".to_string()], vec![MappedField::new(
-                Some(2),
-                vec!["element".to_string()],
-                vec![],
-            )]),
-            MappedField::new(Some(3), vec!["props".to_string()], vec![
-                MappedField::new(Some(4), vec!["key".to_string()], vec![]),
-                MappedField::new(Some(5), vec!["value".to_string()], vec![MappedField::new(
-                    Some(6),
-                    vec!["unit".to_string()],
+            MappedField::new(
+                Some(1),
+                vec!["tags".to_string()],
+                vec![MappedField::new(
+                    Some(2),
+                    vec!["element".to_string()],
                     vec![],
-                )]),
-            ]),
+                )],
+            ),
+            MappedField::new(
+                Some(3),
+                vec!["props".to_string()],
+                vec![
+                    MappedField::new(Some(4), vec!["key".to_string()], vec![]),
+                    MappedField::new(
+                        Some(5),
+                        vec!["value".to_string()],
+                        vec![MappedField::new(Some(6), vec!["unit".to_string()], vec![])],
+                    ),
+                ],
+            ),
         ]);
 
         let mapped = apply_name_mapping_to_arrow_schema(file_schema, &mapping).unwrap();
@@ -3044,15 +3061,23 @@ message schema {
 
         let mapping = NameMapping::new(vec![
             MappedField::new(Some(1), vec!["id".to_string()], vec![]),
-            MappedField::new(Some(2), vec!["tags".to_string()], vec![MappedField::new(
-                Some(3),
-                vec!["element".to_string()],
-                vec![],
-            )]),
-            MappedField::new(Some(4), vec!["props".to_string()], vec![
-                MappedField::new(Some(5), vec!["key".to_string()], vec![]),
-                MappedField::new(Some(6), vec!["value".to_string()], vec![]),
-            ]),
+            MappedField::new(
+                Some(2),
+                vec!["tags".to_string()],
+                vec![MappedField::new(
+                    Some(3),
+                    vec!["element".to_string()],
+                    vec![],
+                )],
+            ),
+            MappedField::new(
+                Some(4),
+                vec!["props".to_string()],
+                vec![
+                    MappedField::new(Some(5), vec!["key".to_string()], vec![]),
+                    MappedField::new(Some(6), vec!["value".to_string()], vec![]),
+                ],
+            ),
         ]);
 
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();

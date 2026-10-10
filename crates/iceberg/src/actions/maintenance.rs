@@ -395,9 +395,14 @@ mod tests {
         let current_manifest = current_manifest_writer.write_manifest_file().await.unwrap();
 
         write_manifest_list(&base, old_list_path, 1, None, 1, vec![old_manifest]).await;
-        write_manifest_list(&base, current_list_path, 2, Some(1), 2, vec![
-            current_manifest,
-        ])
+        write_manifest_list(
+            &base,
+            current_list_path,
+            2,
+            Some(1),
+            2,
+            vec![current_manifest],
+        )
         .await;
 
         let old_snapshot = Arc::new(snapshot(1, None, 1, old_list_path));
@@ -406,39 +411,47 @@ mod tests {
         before.snapshots.insert(1, old_snapshot);
         before.snapshots.insert(2, current_snapshot);
         before.current_snapshot_id = Some(2);
-        before
-            .refs
-            .insert(MAIN_BRANCH.to_string(), SnapshotReference {
+        before.refs.insert(
+            MAIN_BRANCH.to_string(),
+            SnapshotReference {
                 snapshot_id: 2,
                 retention: SnapshotRetention::Branch {
                     min_snapshots_to_keep: None,
                     max_snapshot_age_ms: None,
                     max_ref_age_ms: None,
                 },
-            });
-        before.statistics.insert(1, StatisticsFile {
-            snapshot_id: 1,
-            statistics_path: old_stats_path.to_string(),
-            file_size_in_bytes: 4,
-            file_footer_size_in_bytes: 0,
-            key_metadata: None,
-            blob_metadata: vec![],
-        });
-        before.statistics.insert(2, StatisticsFile {
-            snapshot_id: 2,
-            statistics_path: current_stats_path.to_string(),
-            file_size_in_bytes: 4,
-            file_footer_size_in_bytes: 0,
-            key_metadata: None,
-            blob_metadata: vec![],
-        });
-        before
-            .partition_statistics
-            .insert(1, PartitionStatisticsFile {
+            },
+        );
+        before.statistics.insert(
+            1,
+            StatisticsFile {
+                snapshot_id: 1,
+                statistics_path: old_stats_path.to_string(),
+                file_size_in_bytes: 4,
+                file_footer_size_in_bytes: 0,
+                key_metadata: None,
+                blob_metadata: vec![],
+            },
+        );
+        before.statistics.insert(
+            2,
+            StatisticsFile {
+                snapshot_id: 2,
+                statistics_path: current_stats_path.to_string(),
+                file_size_in_bytes: 4,
+                file_footer_size_in_bytes: 0,
+                key_metadata: None,
+                blob_metadata: vec![],
+            },
+        );
+        before.partition_statistics.insert(
+            1,
+            PartitionStatisticsFile {
                 snapshot_id: 1,
                 statistics_path: old_partition_stats_path.to_string(),
                 file_size_in_bytes: 4,
-            });
+            },
+        );
         let before = Arc::new(before);
 
         let mut after = before.as_ref().clone();
@@ -509,16 +522,17 @@ mod tests {
                 .insert(snapshot.snapshot_id(), Arc::new(snapshot));
         }
         metadata.current_snapshot_id = Some(current);
-        metadata
-            .refs
-            .insert(MAIN_BRANCH.to_string(), SnapshotReference {
+        metadata.refs.insert(
+            MAIN_BRANCH.to_string(),
+            SnapshotReference {
                 snapshot_id: current,
                 retention: SnapshotRetention::Branch {
                     min_snapshots_to_keep: None,
                     max_snapshot_age_ms: None,
                     max_ref_age_ms: None,
                 },
-            });
+            },
+        );
         metadata
     }
 
@@ -562,10 +576,12 @@ mod tests {
                 live_manifests = vec![writer.write_manifest_file().await.unwrap()];
             } else {
                 touch(&base, &data_path(i)).await;
-                let manifest = write_data_manifest(&base, &manifest_path(i), i, [(
-                    data_file(&data_path(i)),
+                let manifest = write_data_manifest(
+                    &base,
+                    &manifest_path(i),
                     i,
-                )])
+                    [(data_file(&data_path(i)), i)],
+                )
                 .await;
                 live_manifests.push(manifest);
             }
@@ -625,10 +641,12 @@ mod tests {
         let current_list_path = "memory://warehouse/table/metadata/current-list.avro";
 
         touch(&base, removed_path).await;
-        let manifest = write_data_manifest(&base, missing_manifest_path, 1, [(
-            data_file(removed_path),
+        let manifest = write_data_manifest(
+            &base,
+            missing_manifest_path,
             1,
-        )])
+            [(data_file(removed_path), 1)],
+        )
         .await;
         write_manifest_list(&base, old_list_path, 1, None, 1, vec![manifest]).await;
         write_manifest_list(&base, current_list_path, 2, Some(1), 2, vec![]).await;

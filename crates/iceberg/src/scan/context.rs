@@ -236,10 +236,12 @@ impl PlanContext {
             self.case_sensitive,
             self.predicate
                 .as_ref()
-                .ok_or(Error::new(
-                    ErrorKind::Unexpected,
-                    "Expected a predicate but none present",
-                ))?
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Expected a predicate but none present",
+                    )
+                })?
                 .as_ref()
                 .bind(self.snapshot_schema.clone(), self.case_sensitive)?,
         )?;

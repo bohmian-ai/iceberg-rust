@@ -1110,10 +1110,10 @@ mod tests {
             let json = Arc::new(arrow_array::StringArray::from(json.to_vec())) as ArrayRef;
             let variant: ArrayRef = json_to_variant(&json).unwrap().into();
             let variant = arrow_cast::cast(&variant, arrow_schema.field(1).data_type()).unwrap();
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Int64Array::from(ids.to_vec())),
-                variant,
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int64Array::from(ids.to_vec())), variant],
+            )
             .unwrap()
         };
         let first = batch([1, 2], [r#"{"a":1}"#, r#"{"a":300}"#]);
@@ -1187,12 +1187,10 @@ mod tests {
             );
         }
         values.sort();
-        assert_eq!(values, [
-            r#"{"a":1}"#,
-            r#"{"a":300}"#,
-            r#"{"b":"x"}"#,
-            r#"{"b":"y"}"#
-        ]);
+        assert_eq!(
+            values,
+            [r#"{"a":1}"#, r#"{"a":300}"#, r#"{"b":"x"}"#, r#"{"b":"y"}"#]
+        );
         let shredded_fields: Vec<Vec<String>> = shredded
             .iter()
             .map(|typed| match typed {
@@ -1380,10 +1378,12 @@ mod tests {
             &[0x01, 0x00, 0x00],
             &[0x01, 0x00, 0x00],
         ];
-        let value_payloads: Vec<&[u8]> =
-            vec![&[0x0c, 0x00], &[0x02, 0x01, 0x00, 0x00, 0xff], &[], &[
-                0x0c, 0x7f,
-            ]];
+        let value_payloads: Vec<&[u8]> = vec![
+            &[0x0c, 0x00],
+            &[0x02, 0x01, 0x00, 0x00, 0xff],
+            &[],
+            &[0x0c, 0x7f],
+        ];
         let metadata_arr = Arc::new(arrow_array::BinaryArray::from_vec(
             metadata_payloads.clone(),
         )) as ArrayRef;
@@ -2026,9 +2026,10 @@ mod tests {
                 ordered,
             )
         }) as ArrayRef;
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col0, col1, col2, col3, col4, col5,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![col0, col1, col2, col3, col4, col5],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2215,10 +2216,13 @@ mod tests {
                 .with_precision_and_scale(38, 5)
                 .unwrap(),
         ) as ArrayRef;
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12, col13,
-            col14, col15, col16,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12,
+                col13, col14, col15, col16,
+            ],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2811,10 +2815,10 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            struct_float_field_col,
-            struct_nested_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![struct_float_field_col, struct_nested_float_field_col],
+        )
         .unwrap();
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -2969,11 +2973,14 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            list_float_field_col,
-            struct_list_float_field_col,
-            // large_list_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                list_float_field_col,
+                struct_list_float_field_col,
+                // large_list_float_field_col,
+            ],
+        )
         .expect("Could not form record batch");
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),
@@ -3151,10 +3158,10 @@ mod tests {
             None,
         )) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            map_array,
-            struct_list_float_field_col,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![map_array, struct_list_float_field_col],
+        )
         .expect("Could not form record batch");
         let output_file = file_io.new_output(
             location_gen.generate_location(None, &file_name_gen.generate_file_name()),

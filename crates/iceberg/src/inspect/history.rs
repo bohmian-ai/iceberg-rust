@@ -108,12 +108,15 @@ impl<'a> HistoryTable<'a> {
             is_current_ancestor.append_value(ancestors.contains(&entry.snapshot_id));
         }
 
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![
-            Arc::new(made_current_at.finish()),
-            Arc::new(snapshot_id.finish()),
-            Arc::new(parent_id.finish()),
-            Arc::new(is_current_ancestor.finish()),
-        ])?;
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(made_current_at.finish()),
+                Arc::new(snapshot_id.finish()),
+                Arc::new(parent_id.finish()),
+                Arc::new(is_current_ancestor.finish()),
+            ],
+        )?;
 
         Ok(stream::iter(vec![Ok(batch)]).boxed())
     }

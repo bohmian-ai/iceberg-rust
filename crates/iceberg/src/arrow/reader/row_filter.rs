@@ -460,27 +460,30 @@ mod tests {
     async fn test_predicate_cast_literal() {
         let predicates = vec![
             // a == 'foo'
-            (Reference::new("a").equal_to(Datum::string("foo")), vec![
-                Some("foo".to_string()),
-            ]),
+            (
+                Reference::new("a").equal_to(Datum::string("foo")),
+                vec![Some("foo".to_string())],
+            ),
             // a != 'foo'
             (
                 Reference::new("a").not_equal_to(Datum::string("foo")),
                 vec![Some("bar".to_string())],
             ),
             // STARTS_WITH(a, 'foo')
-            (Reference::new("a").starts_with(Datum::string("f")), vec![
-                Some("foo".to_string()),
-            ]),
+            (
+                Reference::new("a").starts_with(Datum::string("f")),
+                vec![Some("foo".to_string())],
+            ),
             // NOT STARTS_WITH(a, 'foo')
             (
                 Reference::new("a").not_starts_with(Datum::string("f")),
                 vec![Some("bar".to_string())],
             ),
             // a < 'foo'
-            (Reference::new("a").less_than(Datum::string("foo")), vec![
-                Some("bar".to_string()),
-            ]),
+            (
+                Reference::new("a").less_than(Datum::string("foo")),
+                vec![Some("bar".to_string())],
+            ),
             // a <= 'foo'
             (
                 Reference::new("a").less_than_or_equal_to(Datum::string("foo")),
@@ -557,17 +560,20 @@ mod tests {
         let file_path = format!("{table_location}/multi_row_group.parquet");
 
         // Force each batch into its own row group for testing byte range filtering.
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (0..100).collect::<Vec<i32>>(),
-        ))])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+        )
         .unwrap();
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (100..200).collect::<Vec<i32>>(),
-        ))])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((100..200).collect::<Vec<i32>>()))],
+        )
         .unwrap();
-        let batch3 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (200..300).collect::<Vec<i32>>(),
-        ))])
+        let batch3 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((200..300).collect::<Vec<i32>>()))],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -752,9 +758,10 @@ mod tests {
         let file = File::create(&file_path).unwrap();
         let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
         for chunk in [0..100, 100..200, 200..300] {
-            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-                Int32Array::from(chunk.collect::<Vec<i32>>()),
-            )])
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from(chunk.collect::<Vec<i32>>()))],
+            )
             .unwrap();
             writer.write(&batch).expect("Writing batch");
         }
@@ -851,9 +858,10 @@ mod tests {
         let file = File::create(&file_path).unwrap();
         let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
         for chunk in [0..100, 100..200, 200..300] {
-            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-                Int32Array::from(chunk.collect::<Vec<i32>>()),
-            )])
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from(chunk.collect::<Vec<i32>>()))],
+            )
             .unwrap();
             writer.write(&batch).expect("Writing batch");
         }
@@ -1211,16 +1219,19 @@ mod tests {
             .set_statistics_enabled(EnabledStatistics::None)
             .build();
 
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
-            Arc::new(StringArray::from(vec![
-                Some("alice"),
-                Some("bob"),
-                None,
-                Some("dana"),
-                Some("eve"),
-            ])) as ArrayRef,
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("alice"),
+                    Some("bob"),
+                    None,
+                    Some("dana"),
+                    Some("eve"),
+                ])) as ArrayRef,
+            ],
+        )
         .unwrap();
 
         let file = File::create(&file_path).unwrap();
@@ -1312,15 +1323,18 @@ mod tests {
             Field::new("pos", DataType::Int64, false),
         ]));
 
-        let pos_del_batch = RecordBatch::try_new(pos_del_arrow_schema.clone(), vec![
-            // Both deletions reference the same data file
-            Arc::new(StringArray::from(vec![
-                file_path.as_str(),
-                file_path.as_str(),
-            ])) as ArrayRef,
-            // Delete by index - index-0 (`1` in test case) and index-2 (`3` in test case)
-            Arc::new(Int64Array::from(vec![0i64, 2i64])) as ArrayRef,
-        ])
+        let pos_del_batch = RecordBatch::try_new(
+            pos_del_arrow_schema.clone(),
+            vec![
+                // Both deletions reference the same data file
+                Arc::new(StringArray::from(vec![
+                    file_path.as_str(),
+                    file_path.as_str(),
+                ])) as ArrayRef,
+                // Delete by index - index-0 (`1` in test case) and index-2 (`3` in test case)
+                Arc::new(Int64Array::from(vec![0i64, 2i64])) as ArrayRef,
+            ],
+        )
         .unwrap();
 
         // Write position delete file also without indices
@@ -1480,20 +1494,23 @@ mod tests {
         let slots: Vec<(usize, usize)> = (0..BLOOM_ROW_GROUPS)
             .flat_map(|group| (0..BLOOM_ROWS_PER_GROUP).map(move |row| (group, row * 2)))
             .collect();
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(
-                FixedSizeBinaryArray::try_from_iter(
-                    slots.iter().map(|&(group, k)| bloom_trace_id(group, k)),
-                )
-                .unwrap(),
-            ) as ArrayRef,
-            Arc::new(StringArray::from_iter_values(
-                slots.iter().map(|&(group, k)| bloom_service(group, k)),
-            )) as ArrayRef,
-            Arc::new(Int64Array::from_iter_values(
-                slots.iter().map(|&(group, k)| bloom_seq(group, k)),
-            )) as ArrayRef,
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(
+                        slots.iter().map(|&(group, k)| bloom_trace_id(group, k)),
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+                Arc::new(StringArray::from_iter_values(
+                    slots.iter().map(|&(group, k)| bloom_service(group, k)),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(
+                    slots.iter().map(|&(group, k)| bloom_seq(group, k)),
+                )) as ArrayRef,
+            ],
+        )
         .unwrap();
 
         let mut props = WriterProperties::builder()

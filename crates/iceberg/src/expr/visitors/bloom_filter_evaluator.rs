@@ -392,29 +392,32 @@ mod tests {
             Field::new("uuid", DataType::FixedSizeBinary(16), false),
         ]));
         let rows = 0..10i64;
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int32Array::from_iter_values(
-                rows.clone().map(|i| i as i32 * 10),
-            )) as ArrayRef,
-            Arc::new(Int64Array::from_iter_values(
-                rows.clone().map(|i| i * 1_000_000_007),
-            )),
-            Arc::new(Date32Array::from_iter_values(
-                rows.clone().map(|i| 19_000 + i as i32),
-            )),
-            Arc::new(TimestampMicrosecondArray::from_iter_values(
-                rows.clone().map(|i| TS_BASE + i),
-            )),
-            Arc::new(TimestampMillisecondArray::from_iter_values(
-                rows.clone().map(|i| TS_BASE + i),
-            )),
-            Arc::new(
-                FixedSizeBinaryArray::try_from_iter(
-                    rows.clone().map(|i| row_uuid(i as u128).into_bytes()),
-                )
-                .unwrap(),
-            ),
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(
+                    rows.clone().map(|i| i as i32 * 10),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(
+                    rows.clone().map(|i| i * 1_000_000_007),
+                )),
+                Arc::new(Date32Array::from_iter_values(
+                    rows.clone().map(|i| 19_000 + i as i32),
+                )),
+                Arc::new(TimestampMicrosecondArray::from_iter_values(
+                    rows.clone().map(|i| TS_BASE + i),
+                )),
+                Arc::new(TimestampMillisecondArray::from_iter_values(
+                    rows.clone().map(|i| TS_BASE + i),
+                )),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(
+                        rows.clone().map(|i| row_uuid(i as u128).into_bytes()),
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
         .unwrap();
 
         let dir = TempDir::new().unwrap();

@@ -734,10 +734,13 @@ mod tests {
         // Create test data
         let arrow_schema = make_test_arrow_schema();
 
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-        ])?;
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            ],
+        )?;
 
         // Write data
         writer.write(batch.clone()).await?;
@@ -1280,9 +1283,10 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        Ok(RecordBatch::try_new(schema, vec![
-            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
-        ])?)
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )?)
     }
 
     /// Drives three writes through a fresh writer, optionally observed.
@@ -1373,11 +1377,14 @@ mod tests {
             }
             reasons.push(*reason);
         }
-        assert_eq!(reasons, vec![
-            RollingCloseReason::Threshold,
-            RollingCloseReason::Threshold,
-            RollingCloseReason::Final,
-        ]);
+        assert_eq!(
+            reasons,
+            vec![
+                RollingCloseReason::Threshold,
+                RollingCloseReason::Threshold,
+                RollingCloseReason::Final,
+            ]
+        );
         Ok(())
     }
 

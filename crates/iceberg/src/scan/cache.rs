@@ -64,10 +64,12 @@ impl PartitionFilterCache {
 
         let partition_spec = table_metadata
             .partition_spec_by_id(spec_id)
-            .ok_or(Error::new(
-                ErrorKind::Unexpected,
-                format!("Could not find partition spec for id {spec_id}"),
-            ))?;
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Could not find partition spec for id {spec_id}"),
+                )
+            })?;
 
         // A historical spec may reference a source column that was later dropped from the
         // schema, which is a legitimate v2+ state. Such a spec cannot be resolved to a

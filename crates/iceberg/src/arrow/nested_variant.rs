@@ -343,11 +343,14 @@ mod tests {
     fn nested_variants_shred_and_unshred_in_place() {
         let (field, array) = events();
         let paths = variant_field_paths(&Fields::from(vec![Arc::clone(&field)]));
-        assert_eq!(paths, vec![vec![
-            "events".to_owned(),
-            "element".to_owned(),
-            "attributes".to_owned()
-        ]]);
+        assert_eq!(
+            paths,
+            vec![vec![
+                "events".to_owned(),
+                "element".to_owned(),
+                "attributes".to_owned()
+            ]]
+        );
         let shredding =
             DataType::Struct(Fields::from(vec![Field::new("k", DataType::Int64, true)]));
         let (shredded_field, shredded) =

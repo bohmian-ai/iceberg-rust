@@ -268,17 +268,22 @@ impl AesGcmCipher {
 }
 
 fn encrypt_aes_gcm<C>(key_bytes: &[u8], plaintext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>>
-where C: Aead + AeadCore + KeyInit {
+where
+    C: Aead + AeadCore + KeyInit,
+{
     let cipher = C::new_from_slice(key_bytes).map_err(|e| {
         Error::new(ErrorKind::DataInvalid, "Invalid AES key").with_source(anyhow::anyhow!(e))
     })?;
     let nonce = C::generate_nonce(&mut OsRng);
 
     let ciphertext = if let Some(aad) = aad {
-        cipher.encrypt(&nonce, Payload {
-            msg: plaintext,
-            aad,
-        })
+        cipher.encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
     } else {
         cipher.encrypt(&nonce, plaintext.as_ref())
     }
@@ -295,7 +300,9 @@ where C: Aead + AeadCore + KeyInit {
 }
 
 fn decrypt_aes_gcm<C>(key_bytes: &[u8], ciphertext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>>
-where C: Aead + AeadCore + KeyInit {
+where
+    C: Aead + AeadCore + KeyInit,
+{
     let cipher = C::new_from_slice(key_bytes).map_err(|e| {
         Error::new(ErrorKind::DataInvalid, "Invalid AES key").with_source(anyhow::anyhow!(e))
     })?;
@@ -304,10 +311,13 @@ where C: Aead + AeadCore + KeyInit {
     let encrypted_data = &ciphertext[AesGcmCipher::NONCE_LEN..];
 
     let plaintext = if let Some(aad) = aad {
-        cipher.decrypt(nonce, Payload {
-            msg: encrypted_data,
-            aad,
-        })
+        cipher.decrypt(
+            nonce,
+            Payload {
+                msg: encrypted_data,
+                aad,
+            },
+        )
     } else {
         cipher.decrypt(nonce, encrypted_data)
     }

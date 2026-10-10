@@ -176,7 +176,9 @@ pub trait ArrowSchemaVisitor {
     /// Takes the `&FieldRef` rather than a `&DataType` because the variant signal
     /// lives on the field's metadata, not on its data type.
     fn variant(&mut self, field: &FieldRef) -> Result<Self::T>
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         visit_type(field.data_type(), self)
     }
 }
@@ -2240,10 +2242,13 @@ mod tests {
             ],
             None,
         );
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![10, 11])) as ArrayRef,
-            Arc::new(variant) as ArrayRef,
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 11])) as ArrayRef,
+                Arc::new(variant) as ArrayRef,
+            ],
+        )
         .unwrap();
 
         let dir = tempfile::TempDir::new().unwrap();

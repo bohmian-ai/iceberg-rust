@@ -115,17 +115,20 @@ impl<'de> Deserialize<'de> for CompressionCodec {
             "brotli" => Ok(CompressionCodec::brotli_default()),
             "lzo" => Ok(CompressionCodec::Lzo),
             "snappy" => Ok(CompressionCodec::Snappy),
-            other => Err(serde::de::Error::unknown_variant(other, &[
-                "none",
-                "uncompressed",
-                "lz4",
-                "lz4_raw",
-                "zstd",
-                "gzip",
-                "brotli",
-                "lzo",
-                "snappy",
-            ])),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &[
+                    "none",
+                    "uncompressed",
+                    "lz4",
+                    "lz4_raw",
+                    "zstd",
+                    "gzip",
+                    "brotli",
+                    "lzo",
+                    "snappy",
+                ],
+            )),
         }
     }
 }

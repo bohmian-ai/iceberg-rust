@@ -248,10 +248,14 @@ mod tests {
     #[test]
     fn test_multiple_fields_sorted_by_id() {
         let schema = test_schema();
-        let spec = build_spec(&schema, 0, vec![
-            (3, "ts_year", Transform::Year),
-            (4, "category", Transform::Identity),
-        ]);
+        let spec = build_spec(
+            &schema,
+            0,
+            vec![
+                (3, "ts_year", Transform::Year),
+                (4, "category", Transform::Identity),
+            ],
+        );
 
         let result = compute_unified_partition_type([&spec].into_iter(), &schema).unwrap();
         assert_eq!(result.fields().len(), 2);
