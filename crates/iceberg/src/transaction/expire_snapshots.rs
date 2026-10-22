@@ -477,18 +477,15 @@ impl TransactionAction for ExpireSnapshotsAction {
 
         // The ref assertion closes the race where a concurrent writer advances `main` between
         // selection and commit, which could orphan a snapshot whose parent we are about to remove.
-        Ok(ActionCommit::new(
-            updates,
-            vec![
-                TableRequirement::UuidMatch {
-                    uuid: metadata.uuid(),
-                },
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: MAIN_BRANCH.to_string(),
-                    snapshot_id: metadata.current_snapshot_id(),
-                },
-            ],
-        ))
+        Ok(ActionCommit::new(updates, vec![
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: MAIN_BRANCH.to_string(),
+                snapshot_id: metadata.current_snapshot_id(),
+            },
+        ]))
     }
 }
 
@@ -997,15 +994,12 @@ mod tests {
             .metadata()
             .clone()
             .into_builder(None)
-            .set_ref(
-                "history-tag",
-                SnapshotReference {
-                    snapshot_id: OLD_SNAPSHOT,
-                    retention: SnapshotRetention::Tag {
-                        max_ref_age_ms: None,
-                    },
+            .set_ref("history-tag", SnapshotReference {
+                snapshot_id: OLD_SNAPSHOT,
+                retention: SnapshotRetention::Tag {
+                    max_ref_age_ms: None,
                 },
-            )
+            })
             .unwrap()
             .build()
             .unwrap()

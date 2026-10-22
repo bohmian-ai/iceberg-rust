@@ -271,15 +271,12 @@ pub(crate) mod tests {
         ))
         .unwrap();
         // The template has two snapshots; point the current one at our manifest list.
-        let metadata_json = render_template(
-            &template,
-            context! {
-                table_location => &table_location,
-                manifest_list_1_location => &manifest_list_location,
-                manifest_list_2_location => &manifest_list_location,
-                table_metadata_1_location => &table_metadata_location,
-            },
-        );
+        let metadata_json = render_template(&template, context! {
+            table_location => &table_location,
+            manifest_list_1_location => &manifest_list_location,
+            manifest_list_2_location => &manifest_list_location,
+            table_metadata_1_location => &table_metadata_location,
+        });
         let table_metadata = serde_json::from_str::<TableMetadata>(&metadata_json).unwrap();
 
         let table = Table::builder()
@@ -1105,18 +1102,15 @@ pub(crate) mod tests {
                 && ref_name == target_branch
                 && reference.snapshot_id == snapshot_id
         ));
-        assert_eq!(
-            requirements,
-            vec![
-                TableRequirement::UuidMatch {
-                    uuid: table.metadata().uuid(),
-                },
-                TableRequirement::RefSnapshotIdMatch {
-                    r#ref: target_branch.to_string(),
-                    snapshot_id: None,
-                },
-            ]
-        );
+        assert_eq!(requirements, vec![
+            TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: target_branch.to_string(),
+                snapshot_id: None,
+            },
+        ]);
     }
 
     #[tokio::test]
