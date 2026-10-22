@@ -57,6 +57,8 @@ pub struct TableScanBuilder<'a> {
     // Defaults to none which means select all columns
     column_names: Option<Vec<String>>,
     snapshot_id: Option<i64>,
+    // Retained schema the projection and filter bind to; the snapshot's when unset.
+    schema_id: Option<i32>,
     // Exclusive lower bound for an incremental scan.
     from_snapshot_id: Option<i64>,
     // Inclusive upper bound for an incremental scan.
@@ -79,6 +81,7 @@ impl<'a> TableScanBuilder<'a> {
             table,
             column_names: None,
             snapshot_id: None,
+            schema_id: None,
             from_snapshot_id: None,
             to_snapshot_id: None,
             batch_size: None,
@@ -139,6 +142,17 @@ impl<'a> TableScanBuilder<'a> {
     /// Set the snapshot to scan. When not set, it uses current snapshot.
     pub fn snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Binds the projection and filter to this retained schema instead of the
+    /// scanned snapshot's.
+    ///
+    /// Field ids are stable across schema evolution, so a scan of an older
+    /// snapshot planned under a newer schema resolves renamed columns by id and
+    /// treats columns the snapshot's files predate as absent.
+    pub fn with_schema_id(mut self, schema_id: i32) -> Self {
+        self.schema_id = Some(schema_id);
         self
     }
 
@@ -286,7 +300,20 @@ impl<'a> TableScanBuilder<'a> {
             ));
         }
 
-        let schema = snapshot.schema(self.table.metadata())?;
+        let schema = match self.schema_id {
+            Some(schema_id) => self
+                .table
+                .metadata()
+                .schema_by_id(schema_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Schema with id {schema_id} not found"),
+                    )
+                })?
+                .clone(),
+            None => snapshot.schema(self.table.metadata())?,
+        };
 
         // Check that all column names exist in the schema (skip reserved columns).
         if let Some(column_names) = self.column_names.as_ref() {
@@ -1943,6 +1970,17 @@ pub mod tests {
 
         let table_scan = table.scan().snapshot_id(1024).build();
         assert!(table_scan.is_err());
+    }
+
+    #[test]
+    fn test_table_scan_binds_to_the_requested_schema() {
+        let table = TableTestFixture::new().table;
+        let scan = || table.scan().snapshot_id(3055729675574597004).select(["y"]);
+
+        assert!(scan().build().is_ok());
+        assert!(scan().with_schema_id(0).build().is_err());
+        assert!(scan().with_schema_id(1).build().is_ok());
+        assert!(scan().with_schema_id(7).build().is_err());
     }
 
     #[tokio::test]
