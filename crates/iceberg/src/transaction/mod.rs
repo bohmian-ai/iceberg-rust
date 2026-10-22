@@ -54,6 +54,7 @@ mod action;
 
 pub use action::*;
 mod append;
+mod apply_updates;
 mod expire_snapshots;
 mod maintenance;
 mod manifest_filter;
@@ -71,6 +72,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use append::FastAppendAction;
+pub use apply_updates::ApplyUpdatesAction;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
 pub use maintenance::{CleanupTraversalLimits, ExpiredFileSet, expired_files_between};
 pub use manifest_filter::{ManifestFilterManager, ManifestWriterContext};
@@ -188,6 +190,11 @@ impl Transaction {
     /// Creates an action that rewrites manifest files without changing table data.
     pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
         RewriteManifestsAction::new()
+    }
+
+    /// Creates an action that commits caller-built metadata updates as given.
+    pub fn apply_updates(&self) -> ApplyUpdatesAction {
+        ApplyUpdatesAction::new()
     }
 
     /// Creates replace sort order action.

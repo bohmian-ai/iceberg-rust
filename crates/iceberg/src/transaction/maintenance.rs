@@ -456,13 +456,17 @@ mod tests {
     #[tokio::test]
     async fn expired_files_classifies_fixture_paths_and_collapses_duplicates() {
         let (table, _temp_dir, before, after) = cleanup_fixture().await;
-        let expired =
-            expired_files_between(table.file_io(), &before, &after, CleanupTraversalLimits {
+        let expired = expired_files_between(
+            table.file_io(),
+            &before,
+            &after,
+            CleanupTraversalLimits {
                 max_items: 100,
                 max_bytes: u64::MAX,
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         assert!(!expired.limit_exhausted);
         assert_eq!(expired.data_files.len(), 1);
         assert_eq!(expired.delete_files.len(), 1);
@@ -476,14 +480,17 @@ mod tests {
     async fn expired_files_rejects_negative_statistics_size() {
         let table = make_v2_minimal_table();
         let mut before = table.metadata().clone();
-        before.statistics.insert(1, StatisticsFile {
-            snapshot_id: 1,
-            statistics_path: "memory://negative.stats".to_string(),
-            file_size_in_bytes: -1,
-            file_footer_size_in_bytes: 0,
-            key_metadata: None,
-            blob_metadata: Vec::new(),
-        });
+        before.statistics.insert(
+            1,
+            StatisticsFile {
+                snapshot_id: 1,
+                statistics_path: "memory://negative.stats".to_string(),
+                file_size_in_bytes: -1,
+                file_footer_size_in_bytes: 0,
+                key_metadata: None,
+                blob_metadata: Vec::new(),
+            },
+        );
         let error = expired_files_between(
             table.file_io(),
             &before,
