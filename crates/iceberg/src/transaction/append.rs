@@ -237,7 +237,7 @@ pub(crate) mod tests {
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
         ManifestWriterBuilder, NestedField, PartitionSpec, SnapshotRef, Struct, TableMetadata,
-        Type, VariantType,
+        Type, UnboundPartitionSpec, VariantType,
     };
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
@@ -833,6 +833,75 @@ pub(crate) mod tests {
                 .unwrap(),
             "val"
         );
+    }
+
+    /// A file may be appended under any retained partition spec; each spec's
+    /// files land in their own manifest, and an unknown spec is refused.
+    #[tokio::test]
+    async fn test_fast_append_accepts_retained_partition_specs() {
+        let base = make_v2_minimal_table();
+        let metadata = base
+            .metadata()
+            .clone()
+            .into_builder(Some("memory:///test/location/metadata/v1.json".to_string()))
+            .set_location("memory:///test/location".to_string())
+            .add_partition_spec(UnboundPartitionSpec::builder().with_spec_id(1).build())
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = base.with_metadata(Arc::new(metadata));
+        assert_eq!(table.metadata().default_partition_spec_id(), 1);
+        let file = |path: &str, spec_id: i32, partition: Struct| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path.to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(1)
+                .partition_spec_id(spec_id)
+                .partition(partition)
+                .build()
+                .unwrap()
+        };
+        let old = file("test/old.parquet", 0, Struct::from_iter([Some(Literal::long(300))]));
+        let new = file("test/new.parquet", 1, Struct::empty());
+
+        let action = Transaction::new(&table)
+            .fast_append()
+            .add_data_files(vec![new.clone(), old.clone()]);
+        let mut commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = commit.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!()
+        };
+        let manifest_list = table
+            .manifest_list_reader(&SnapshotRef::new(snapshot.clone()))
+            .load()
+            .await
+            .unwrap();
+        let mut by_spec = Vec::new();
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            by_spec.push((
+                manifest_file.partition_spec_id,
+                manifest
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.data_file().clone())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        by_spec.sort_by_key(|(spec_id, _)| *spec_id);
+        assert_eq!(by_spec, vec![(0, vec![old]), (1, vec![new])]);
+
+        let unknown = file("test/unknown.parquet", 7, Struct::empty());
+        let action = Transaction::new(&table)
+            .fast_append()
+            .add_data_files(vec![unknown]);
+        assert!(Arc::new(action).commit(&table).await.is_err());
     }
 
     #[tokio::test]

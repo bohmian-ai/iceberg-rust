@@ -209,20 +209,26 @@ impl<'a> SnapshotProducer<'a> {
         }
     }
 
+    /// Checks every added file names a partition spec the table retains and
+    /// carries a partition value of that spec's type.
+    ///
+    /// As in the Java implementation, a file may be added under any retained
+    /// spec, not only the default: a file written before a spec change keeps
+    /// the spec it was partitioned by.
     pub(crate) fn validate_added_files(&self, files: &[DataFile]) -> Result<()> {
+        let metadata = self.table.metadata();
         for data_file in files {
-            // Check if the data file partition spec id matches the table default partition spec id.
-            if self.table.metadata().default_partition_spec_id() != data_file.partition_spec_id {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Data file partition spec id does not match table default partition spec id",
-                ));
-            }
-            Self::validate_partition_value(
-                data_file.partition(),
-                self.table.metadata().default_partition_type(),
-                self.table.metadata().default_partition_spec(),
-            )?;
+            let spec = metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "Data file partition spec id is not a partition spec of the table",
+                    )
+                    .with_context("partition spec id", data_file.partition_spec_id.to_string())
+                })?;
+            let partition_type = spec.partition_type(metadata.current_schema())?;
+            Self::validate_partition_value(data_file.partition(), &partition_type, spec)?;
         }
 
         Ok(())
@@ -520,9 +526,31 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
+    /// Writes the added files into one manifest per partition spec, in spec
+    /// id order, because a manifest records exactly one spec.
+    async fn write_added_manifests(
+        &self,
+        added_files: Vec<DataFile>,
+        data_sequence_number: Option<i64>,
+    ) -> Result<Vec<ManifestFile>> {
+        let mut by_spec: BTreeMap<i32, Vec<DataFile>> = BTreeMap::new();
+        for file in added_files {
+            by_spec.entry(file.partition_spec_id).or_default().push(file);
+        }
+        let mut manifests = Vec::with_capacity(by_spec.len());
+        for (spec_id, files) in by_spec {
+            manifests.push(
+                self.write_added_manifest(files, spec_id, data_sequence_number)
+                    .await?,
+            );
+        }
+        Ok(manifests)
+    }
+
     async fn write_added_manifest(
         &self,
         added_files: Vec<DataFile>,
+        partition_spec_id: i32,
         data_sequence_number: Option<i64>,
     ) -> Result<ManifestFile> {
         let Some(first_file) = added_files.first() else {
@@ -564,8 +592,7 @@ impl<'a> SnapshotProducer<'a> {
                 builder.build()
             }
         });
-        let mut writer =
-            self.new_manifest_writer(content, self.table.metadata().default_partition_spec_id())?;
+        let mut writer = self.new_manifest_writer(content, partition_spec_id)?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
@@ -726,16 +753,15 @@ impl<'a> SnapshotProducer<'a> {
 
         if !self.added_data_files.is_empty() {
             let added_files = std::mem::take(&mut self.added_data_files);
-            let added_manifest = self
-                .write_added_manifest(added_files, self.new_data_file_sequence_number)
-                .await?;
-            manifest_files.push(added_manifest);
+            manifest_files.extend(
+                self.write_added_manifests(added_files, self.new_data_file_sequence_number)
+                    .await?,
+            );
         }
 
         if !self.added_delete_files.is_empty() {
             let added_files = std::mem::take(&mut self.added_delete_files);
-            let added_manifest = self.write_added_manifest(added_files, None).await?;
-            manifest_files.push(added_manifest);
+            manifest_files.extend(self.write_added_manifests(added_files, None).await?);
         }
 
         let operation_entries = snapshot_produce_operation.delete_entries(self).await?;
