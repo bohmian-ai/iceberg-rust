@@ -574,6 +574,30 @@ impl SqlCatalog {
         Ok(requested)
     }
 
+    /// Returns whether `after` declares a different effective definition
+    /// than `before`.
+    ///
+    /// The definition is the current schema, default partition spec, default
+    /// sort order and every property except the configured table version;
+    /// snapshot, log and timestamp bookkeeping is not part of it. A
+    /// version-intended edit that leaves all of them unchanged would consume
+    /// a version and stale every writer bound to the current one for nothing.
+    fn edits_definition(&self, before: &TableMetadata, after: &TableMetadata) -> bool {
+        let version = self.table_version_property.as_ref();
+        let properties = |metadata: &TableMetadata| {
+            metadata
+                .properties()
+                .iter()
+                .filter(|(key, _)| Some(*key) != version)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+        before.current_schema() != after.current_schema()
+            || before.default_partition_spec() != after.default_partition_spec()
+            || before.default_sort_order() != after.default_sort_order()
+            || properties(before) != properties(after)
+    }
+
     /// Stages the retained reference of one committed table version.
     async fn insert_table_version(
         &self,
@@ -1346,7 +1370,16 @@ impl Catalog for SqlCatalog {
             }
         }
 
+        let current_metadata = current_table.metadata_ref();
         let staged_table = commit.apply(current_table)?;
+        if requested_version.is_some()
+            && !self.edits_definition(&current_metadata, staged_table.metadata())
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("table {table_ident} definition edit changes nothing"),
+            ));
+        }
         let staged_metadata_location_str = staged_table.metadata_location_result()?;
         let staged_metadata_location = MetadataLocation::from_str(staged_metadata_location_str)?;
 
@@ -2820,5 +2853,31 @@ mod tests {
             "a native definition edit must advance the table version"
         );
         assert_eq!(retained_versions(&catalog).await.len(), 1);
+
+        let bloom = r#"["a","b"]"#;
+        let edited = set_properties(&catalog, &table, &[("bloom", bloom), (TABLE_VERSION, "2")])
+            .await
+            .unwrap();
+        let pointer = edited.metadata_location().map(str::to_owned);
+        assert!(
+            set_properties(&catalog, &edited, &[("bloom", bloom), (TABLE_VERSION, "3")])
+                .await
+                .is_err(),
+            "a version-intended edit that changes nothing is refused"
+        );
+        let current = catalog.load_table(edited.identifier()).await.unwrap();
+        assert_eq!(current.metadata_location().map(str::to_owned), pointer);
+        assert_eq!(
+            current.metadata().properties().get(TABLE_VERSION),
+            Some(&"2".to_string())
+        );
+        assert_eq!(retained_versions(&catalog).await.len(), 2);
+        set_properties(&catalog, &edited, &[
+            ("bloom", r#"["b","a"]"#),
+            (TABLE_VERSION, "3"),
+        ])
+        .await
+        .expect("a reordered Bloom list is an effective edit");
+        assert_eq!(retained_versions(&catalog).await.len(), 3);
     }
 }
