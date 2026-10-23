@@ -1296,6 +1296,38 @@ impl Catalog for SqlCatalog {
     /// `r + 1` must apply to a base at version `r`; any other base is a
     /// non-retryable stale-version conflict. The pointer swap and the new
     /// version's retained reference commit in one SQL transaction.
+    async fn list_table_version_locations(
+        &self,
+        table: &TableIdent,
+        table_uuid: &str,
+    ) -> Result<Vec<String>> {
+        let rows = self
+            .fetch_rows(
+                &format!(
+                    "SELECT {CATALOG_FIELD_METADATA_LOCATION_PROP}
+                     FROM {TABLE_VERSION_TABLE_NAME}
+                     WHERE {CATALOG_FIELD_CATALOG_NAME} = ?
+                      AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
+                      AND {CATALOG_FIELD_TABLE_NAME} = ?
+                      AND {TABLE_VERSION_FIELD_TABLE_UUID} = ?
+                     ORDER BY {TABLE_VERSION_FIELD_VERSION}"
+                ),
+                vec![
+                    Some(&self.name),
+                    Some(&table.namespace().join(".")),
+                    Some(table.name()),
+                    Some(table_uuid),
+                ],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                row.try_get::<String, _>(CATALOG_FIELD_METADATA_LOCATION_PROP)
+                    .map_err(from_sqlx_error)
+            })
+            .collect()
+    }
+
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
         let requested_version = self.requested_table_version(commit.updates())?;
@@ -2673,9 +2705,27 @@ mod tests {
         let second = edited.metadata_location().unwrap().to_string();
 
         assert_eq!(retained_versions(&catalog).await, vec![
-            (1, first),
+            (1, first.clone()),
             (2, second.clone())
         ]);
+        let uuid = table.metadata().uuid().to_string();
+        assert_eq!(
+            catalog
+                .list_table_version_locations(table.identifier(), &uuid)
+                .await
+                .unwrap(),
+            vec![first, second.clone()]
+        );
+        assert!(
+            catalog
+                .list_table_version_locations(
+                    table.identifier(),
+                    "00000000-0000-0000-0000-000000000000"
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             catalog
                 .load_metadata_location(table.identifier())

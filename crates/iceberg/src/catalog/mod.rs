@@ -122,6 +122,24 @@ pub trait Catalog: Debug + Sync + Send {
 
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
+
+    /// List the metadata location every committed table version of `table`
+    /// retains, for the table whose metadata UUID is `table_uuid`.
+    ///
+    /// A cleanup owner protects these documents beyond metadata-log rollover.
+    /// A catalog that does not retain version references refuses, so a
+    /// caller never mistakes "unsupported" for "nothing retained".
+    async fn list_table_version_locations(
+        &self,
+        table: &TableIdent,
+        table_uuid: &str,
+    ) -> Result<Vec<String>> {
+        let _ = (table, table_uuid);
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "this catalog does not retain table-version references",
+        ))
+    }
 }
 
 /// Common interface for all catalog builders.
