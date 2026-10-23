@@ -27,7 +27,7 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    Runtime, TableCommit, TableCreation, TableIdent,
+    Runtime, TableCommit, TableCreation, TableIdent, TableUpdate,
 };
 use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow, install_default_drivers};
 use sqlx::{Any, AnyPool, AssertSqlSafe, Connection as _, Row, Transaction};
@@ -42,6 +42,13 @@ pub const SQL_CATALOG_PROP_URI: &str = "uri";
 pub const SQL_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 /// catalog sql bind style
 pub const SQL_CATALOG_PROP_BIND_STYLE: &str = "sql_bind_style";
+/// Table property that carries each table's definition version.
+///
+/// When configured, creation stamps version `1`, a commit that sets the
+/// property to `r + 1` is a definition edit from version `r`, and every
+/// committed version keeps a retained reference to its metadata location
+/// published in the same SQL transaction as the pointer swap.
+pub const SQL_CATALOG_PROP_TABLE_VERSION: &str = "table-version-property";
 
 static CATALOG_TABLE_NAME: &str = "iceberg_tables";
 static CATALOG_FIELD_CATALOG_NAME: &str = "catalog_name";
@@ -51,6 +58,10 @@ static CATALOG_FIELD_METADATA_LOCATION_PROP: &str = "metadata_location";
 static CATALOG_FIELD_PREVIOUS_METADATA_LOCATION_PROP: &str = "previous_metadata_location";
 static CATALOG_FIELD_RECORD_TYPE: &str = "iceberg_type";
 static CATALOG_FIELD_TABLE_RECORD_TYPE: &str = "TABLE";
+
+static TABLE_VERSION_TABLE_NAME: &str = "iceberg_table_versions";
+static TABLE_VERSION_FIELD_TABLE_UUID: &str = "table_uuid";
+static TABLE_VERSION_FIELD_VERSION: &str = "table_version";
 
 static NAMESPACE_TABLE_NAME: &str = "iceberg_namespace_properties";
 static NAMESPACE_FIELD_NAME: &str = "namespace";
@@ -85,6 +96,22 @@ where
     })
 }
 
+/// Parses a canonical positive decimal table version.
+///
+/// Signs, leading zeros, whitespace, zero and overflow are refused.
+fn parse_table_version(property: &str, value: &str) -> Result<i64> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|version| *version > 0 && version.to_string() == value)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("`{property}` must be a canonical positive decimal, not {value:?}"),
+            )
+        })
+}
+
 /// Builder for [`SqlCatalog`]
 #[derive(Debug)]
 pub struct SqlCatalogBuilder {
@@ -102,6 +129,7 @@ impl Default for SqlCatalogBuilder {
                 name: "".to_string(),
                 warehouse_location: "".to_string(),
                 sql_bind_style: SqlBindStyle::DollarNumeric,
+                table_version_property: None,
                 props: HashMap::new(),
             },
             storage_factory: None,
@@ -196,6 +224,9 @@ impl CatalogBuilder for SqlCatalogBuilder {
             self.config.warehouse_location = warehouse_location;
         }
 
+        self.config.table_version_property =
+            self.config.props.remove(SQL_CATALOG_PROP_TABLE_VERSION);
+
         let name = name.into();
 
         let mut valid_sql_bind_style = true;
@@ -255,6 +286,7 @@ struct SqlCatalogConfig {
     name: String,
     warehouse_location: String,
     sql_bind_style: SqlBindStyle,
+    table_version_property: Option<String>,
     props: HashMap<String, String>,
 }
 
@@ -266,6 +298,7 @@ pub struct SqlCatalog {
     warehouse_location: String,
     fileio: FileIO,
     sql_bind_style: SqlBindStyle,
+    table_version_property: Option<String>,
     runtime: Runtime,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
 }
@@ -366,12 +399,27 @@ impl SqlCatalog {
         .await
         .map_err(from_sqlx_error)?;
 
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE TABLE IF NOT EXISTS {TABLE_VERSION_TABLE_NAME} (
+                {CATALOG_FIELD_CATALOG_NAME} VARCHAR(255) NOT NULL,
+                {CATALOG_FIELD_TABLE_NAMESPACE} VARCHAR(255) NOT NULL,
+                {CATALOG_FIELD_TABLE_NAME} VARCHAR(255) NOT NULL,
+                {TABLE_VERSION_FIELD_TABLE_UUID} VARCHAR(36) NOT NULL,
+                {TABLE_VERSION_FIELD_VERSION} BIGINT NOT NULL,
+                {CATALOG_FIELD_METADATA_LOCATION_PROP} VARCHAR(1000) NOT NULL,
+                PRIMARY KEY ({CATALOG_FIELD_CATALOG_NAME}, {TABLE_VERSION_FIELD_TABLE_UUID}, {TABLE_VERSION_FIELD_VERSION}))"
+        )))
+        .execute(&pool)
+        .await
+        .map_err(from_sqlx_error)?;
+
         Ok(SqlCatalog {
             name: config.name.to_owned(),
             connection: pool,
             warehouse_location: config.warehouse_location,
             fileio,
             sql_bind_style: config.sql_bind_style,
+            table_version_property: config.table_version_property,
             runtime,
             kms_client,
         })
@@ -411,6 +459,155 @@ impl SqlCatalog {
                     .map_err(from_sqlx_error)
             })
             .transpose()
+    }
+
+    /// Reads the retained metadata location of one committed table version.
+    ///
+    /// `table_uuid` is the table's hyphenated metadata UUID, so a recreated
+    /// table under the same name never resolves its predecessor's versions.
+    /// Returns `None` when that version was never committed for that table.
+    pub async fn load_table_version_location(
+        &self,
+        identifier: &TableIdent,
+        table_uuid: &str,
+        table_version: i64,
+    ) -> Result<Option<String>> {
+        let table_version = table_version.to_string();
+        let rows = self
+            .fetch_rows(
+                &format!(
+                    "SELECT {CATALOG_FIELD_METADATA_LOCATION_PROP}
+                     FROM {TABLE_VERSION_TABLE_NAME}
+                     WHERE {CATALOG_FIELD_CATALOG_NAME} = ?
+                      AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
+                      AND {CATALOG_FIELD_TABLE_NAME} = ?
+                      AND {TABLE_VERSION_FIELD_TABLE_UUID} = ?
+                      AND {TABLE_VERSION_FIELD_VERSION} = CAST(? AS BIGINT)"
+                ),
+                vec![
+                    Some(&self.name),
+                    Some(&identifier.namespace().join(".")),
+                    Some(identifier.name()),
+                    Some(table_uuid),
+                    Some(&table_version),
+                ],
+            )
+            .await?;
+        rows.first()
+            .map(|row| {
+                row.try_get::<String, _>(CATALOG_FIELD_METADATA_LOCATION_PROP)
+                    .map_err(from_sqlx_error)
+            })
+            .transpose()
+    }
+
+    /// Reads the configured table version of `metadata`.
+    ///
+    /// Returns `None` when no version property is configured. A configured
+    /// property that is missing or not a canonical positive decimal is
+    /// refused, never defaulted.
+    fn table_version(&self, metadata: &TableMetadata) -> Result<Option<i64>> {
+        let Some(property) = &self.table_version_property else {
+            return Ok(None);
+        };
+        let value = metadata.properties().get(property).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("table metadata has no `{property}`"),
+            )
+        })?;
+        parse_table_version(property, value).map(Some)
+    }
+
+    /// Returns the version a commit's updates publish, if it edits the
+    /// definition.
+    ///
+    /// A commit that sets the configured property is a definition edit and
+    /// must carry at least one other update. Removing the property is refused.
+    fn requested_table_version(&self, updates: &[TableUpdate]) -> Result<Option<i64>> {
+        let Some(property) = &self.table_version_property else {
+            return Ok(None);
+        };
+        let mut requested = None;
+        let mut other_updates = 0_usize;
+        for update in updates {
+            match update {
+                TableUpdate::SetProperties { updates } => {
+                    if let Some(value) = updates.get(property) {
+                        requested = Some(parse_table_version(property, value)?);
+                    }
+                    other_updates += updates.keys().filter(|key| *key != property).count();
+                }
+                TableUpdate::RemoveProperties { removals } => {
+                    if removals.contains(property) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("`{property}` cannot be removed"),
+                        ));
+                    }
+                    other_updates += removals.len();
+                }
+                _ => other_updates += 1,
+            }
+        }
+        if requested.is_some() && other_updates == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("a `{property}` change must accompany a definition edit"),
+            ));
+        }
+        Ok(requested)
+    }
+
+    /// Stages the retained reference of one committed table version.
+    async fn insert_table_version(
+        &self,
+        identifier: &TableIdent,
+        metadata: &TableMetadata,
+        table_version: i64,
+        metadata_location: &str,
+        transaction: &mut Transaction<'_, Any>,
+    ) -> Result<()> {
+        let table_uuid = metadata.uuid().to_string();
+        let table_version = table_version.to_string();
+        self.execute(
+            &format!(
+                "INSERT INTO {TABLE_VERSION_TABLE_NAME}
+                 ({CATALOG_FIELD_CATALOG_NAME}, {CATALOG_FIELD_TABLE_NAMESPACE}, {CATALOG_FIELD_TABLE_NAME}, {TABLE_VERSION_FIELD_TABLE_UUID}, {TABLE_VERSION_FIELD_VERSION}, {CATALOG_FIELD_METADATA_LOCATION_PROP})
+                 VALUES (?, ?, ?, ?, CAST(? AS BIGINT), ?)"
+            ),
+            vec![
+                Some(&self.name),
+                Some(&identifier.namespace().join(".")),
+                Some(identifier.name()),
+                Some(&table_uuid),
+                Some(&table_version),
+                Some(metadata_location),
+            ],
+            Some(transaction),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Commits one publication transaction.
+    ///
+    /// An uncertain COMMIT is resolved from the authoritative pointer: the
+    /// publication succeeded exactly when the pointer names `published`, and
+    /// the pointer and its version reference commit together.
+    async fn commit_publication(
+        &self,
+        transaction: Transaction<'_, Any>,
+        identifier: &TableIdent,
+        published: &str,
+    ) -> Result<()> {
+        let Err(error) = transaction.commit().await else {
+            return Ok(());
+        };
+        match self.load_metadata_location(identifier).await {
+            Ok(Some(location)) if location == published => Ok(()),
+            _ => Err(from_sqlx_error(error)),
+        }
     }
 
     /// SQLX Any does not implement PostgresSQL bindings, so we have to do this.
@@ -468,9 +665,12 @@ impl SqlCatalog {
             Some(t) => sqlx_query.execute(&mut **t).await.map_err(from_sqlx_error),
             None => {
                 let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
-                let result = sqlx_query.execute(&mut *tx).await.map_err(from_sqlx_error);
-                let _ = tx.commit().await.map_err(from_sqlx_error);
-                result
+                let result = sqlx_query
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(from_sqlx_error)?;
+                tx.commit().await.map_err(from_sqlx_error)?;
+                Ok(result)
             }
         }
     }
@@ -934,6 +1134,24 @@ impl Catalog for SqlCatalog {
             }
         };
 
+        let tbl_creation = match &self.table_version_property {
+            Some(property) => {
+                let mut tbl_creation = tbl_creation;
+                let version = tbl_creation
+                    .properties
+                    .entry(property.clone())
+                    .or_insert_with(|| "1".to_string());
+                if version != "1" {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("a new table starts at `{property}` 1, not {version}"),
+                    ));
+                }
+                tbl_creation
+            }
+            None => tbl_creation,
+        };
+
         let tbl_metadata = TableMetadataBuilder::from_table_creation(tbl_creation)?
             .build()?
             .metadata;
@@ -944,11 +1162,24 @@ impl Catalog for SqlCatalog {
             .await?;
 
         let tbl_metadata_location_str = tbl_metadata_location.to_string();
+        let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
         self.execute(&format!(
             "INSERT INTO {CATALOG_TABLE_NAME}
              ({CATALOG_FIELD_CATALOG_NAME}, {CATALOG_FIELD_TABLE_NAMESPACE}, {CATALOG_FIELD_TABLE_NAME}, {CATALOG_FIELD_METADATA_LOCATION_PROP}, {CATALOG_FIELD_RECORD_TYPE})
              VALUES (?, ?, ?, ?, ?)
-            "), vec![Some(&self.name), Some(&namespace.join(".")), Some(&tbl_name.clone()), Some(&tbl_metadata_location_str), Some(CATALOG_FIELD_TABLE_RECORD_TYPE)], None).await?;
+            "), vec![Some(&self.name), Some(&namespace.join(".")), Some(&tbl_name.clone()), Some(&tbl_metadata_location_str), Some(CATALOG_FIELD_TABLE_RECORD_TYPE)], Some(&mut tx)).await?;
+        if let Some(version) = self.table_version(&tbl_metadata)? {
+            self.insert_table_version(
+                &tbl_ident,
+                &tbl_metadata,
+                version,
+                &tbl_metadata_location_str,
+                &mut tx,
+            )
+            .await?;
+        }
+        self.commit_publication(tx, &tbl_ident, &tbl_metadata_location_str)
+            .await?;
 
         let mut builder = Table::builder()
             .file_io(self.fileio.clone())
@@ -1019,11 +1250,18 @@ impl Catalog for SqlCatalog {
         let namespace = table_ident.namespace();
         let tbl_name = table_ident.name().to_string();
 
+        let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
         self.execute(&format!(
             "INSERT INTO {CATALOG_TABLE_NAME}
              ({CATALOG_FIELD_CATALOG_NAME}, {CATALOG_FIELD_TABLE_NAMESPACE}, {CATALOG_FIELD_TABLE_NAME}, {CATALOG_FIELD_METADATA_LOCATION_PROP}, {CATALOG_FIELD_RECORD_TYPE})
              VALUES (?, ?, ?, ?, ?)
-            "), vec![Some(&self.name), Some(&namespace.join(".")), Some(&tbl_name), Some(&metadata_location), Some(CATALOG_FIELD_TABLE_RECORD_TYPE)], None).await?;
+            "), vec![Some(&self.name), Some(&namespace.join(".")), Some(&tbl_name), Some(&metadata_location), Some(CATALOG_FIELD_TABLE_RECORD_TYPE)], Some(&mut tx)).await?;
+        if let Some(version) = self.table_version(&metadata)? {
+            self.insert_table_version(table_ident, &metadata, version, &metadata_location, &mut tx)
+                .await?;
+        }
+        self.commit_publication(tx, table_ident, &metadata_location)
+            .await?;
 
         let mut builder = Table::builder()
             .identifier(table_ident.clone())
@@ -1038,10 +1276,28 @@ impl Catalog for SqlCatalog {
     }
 
     /// Updates an existing table within the SQL catalog.
+    ///
+    /// With a configured table-version property, a commit that sets it to
+    /// `r + 1` must apply to a base at version `r`; any other base is a
+    /// non-retryable stale-version conflict. The pointer swap and the new
+    /// version's retained reference commit in one SQL transaction.
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         let table_ident = commit.identifier().clone();
+        let requested_version = self.requested_table_version(commit.updates())?;
         let current_table = self.load_table(&table_ident).await?;
         let current_metadata_location = current_table.metadata_location_result()?.to_string();
+        if let Some(requested) = requested_version {
+            let base = self.table_version(current_table.metadata())?;
+            if base.and_then(|base| base.checked_add(1)) != Some(requested) {
+                return Err(Error::new(
+                    ErrorKind::CatalogCommitConflicts,
+                    format!(
+                        "table {table_ident} is at version {base:?}, not {}",
+                        requested - 1
+                    ),
+                ));
+            }
+        }
 
         let staged_table = commit.apply(current_table)?;
         let staged_metadata_location_str = staged_table.metadata_location_result()?;
@@ -1053,6 +1309,7 @@ impl Catalog for SqlCatalog {
             .await?;
 
         let staged_metadata_location_str = staged_metadata_location.to_string();
+        let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
         let update_result = self
             .execute(
                 &format!(
@@ -1075,7 +1332,7 @@ impl Catalog for SqlCatalog {
                     Some(&table_ident.namespace().join(".")),
                     Some(current_metadata_location.as_str()),
                 ],
-                None,
+                Some(&mut tx),
             )
             .await?;
 
@@ -1086,6 +1343,18 @@ impl Catalog for SqlCatalog {
             )
             .with_retryable(true));
         }
+        if let Some(requested) = requested_version {
+            self.insert_table_version(
+                &table_ident,
+                staged_table.metadata(),
+                requested,
+                &staged_metadata_location_str,
+                &mut tx,
+            )
+            .await?;
+        }
+        self.commit_publication(tx, &table_ident, &staged_metadata_location_str)
+            .await?;
 
         Ok(staged_table)
     }
@@ -1100,17 +1369,19 @@ mod tests {
     use iceberg::io::LocalFsStorageFactory;
     use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
     use iceberg::table::Table;
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use iceberg::{
         Catalog, CatalogBuilder, ErrorKind, Namespace, NamespaceIdent, TableCreation, TableIdent,
     };
     use itertools::Itertools;
     use regex::Regex;
+    use sqlx::Row;
     use sqlx::migrate::MigrateDatabase;
     use tempfile::TempDir;
 
     use crate::catalog::{
-        NAMESPACE_LOCATION_PROPERTY_KEY, SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI,
-        SQL_CATALOG_PROP_WAREHOUSE,
+        NAMESPACE_LOCATION_PROPERTY_KEY, SQL_CATALOG_PROP_BIND_STYLE,
+        SQL_CATALOG_PROP_TABLE_VERSION, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
     };
     use crate::{SqlBindStyle, SqlCatalog, SqlCatalogBuilder};
 
@@ -2238,5 +2509,239 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    const TABLE_VERSION: &str = "wyrd.bifrost.table-version";
+
+    /// Creates a SQLite catalog that versions table definitions under
+    /// [`TABLE_VERSION`].
+    async fn new_versioned_catalog() -> SqlCatalog {
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+        SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "iceberg",
+                HashMap::from_iter([
+                    (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+                    (SQL_CATALOG_PROP_WAREHOUSE.to_string(), temp_path()),
+                    (
+                        SQL_CATALOG_PROP_TABLE_VERSION.to_string(),
+                        TABLE_VERSION.to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Creates one versioned table and returns it.
+    async fn create_versioned_table(catalog: &SqlCatalog) -> Table {
+        let namespace = NamespaceIdent::new("a".into());
+        create_namespace(catalog, &namespace).await;
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("tbl".into())
+                    .schema(simple_table_schema())
+                    .location(temp_path())
+                    .build(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Commits `properties` on `table` with one catalog update attempt.
+    async fn set_properties(
+        catalog: &SqlCatalog,
+        table: &Table,
+        properties: &[(&str, &str)],
+    ) -> iceberg::Result<Table> {
+        let tx = Transaction::new(table);
+        let action = properties
+            .iter()
+            .fold(tx.update_table_properties(), |action, (key, value)| {
+                action.set((*key).to_string(), (*value).to_string())
+            });
+        action.apply(tx)?.commit_once(catalog).await
+    }
+
+    /// Lists every retained `(table_version, metadata_location)` reference.
+    async fn retained_versions(catalog: &SqlCatalog) -> Vec<(i64, String)> {
+        sqlx::query("SELECT table_version, metadata_location FROM iceberg_table_versions ORDER BY table_version")
+            .fetch_all(&catalog.connection)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn versioned_creation_publishes_version_one() {
+        let catalog = new_versioned_catalog().await;
+        let table = create_versioned_table(&catalog).await;
+        let location = table.metadata_location().unwrap().to_string();
+
+        assert_eq!(
+            table.metadata().properties().get(TABLE_VERSION),
+            Some(&"1".to_string())
+        );
+        assert_eq!(retained_versions(&catalog).await, vec![(
+            1,
+            location.clone()
+        )]);
+        assert_eq!(
+            catalog
+                .load_table_version_location(
+                    table.identifier(),
+                    &table.metadata().uuid().to_string(),
+                    1
+                )
+                .await
+                .unwrap(),
+            Some(location)
+        );
+        assert_eq!(
+            catalog
+                .load_table_version_location(
+                    table.identifier(),
+                    &table.metadata().uuid().to_string(),
+                    2
+                )
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn versioned_creation_refuses_any_other_initial_version() {
+        let catalog = new_versioned_catalog().await;
+        let namespace = NamespaceIdent::new("a".into());
+        create_namespace(&catalog, &namespace).await;
+
+        let refused = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("tbl".into())
+                    .schema(simple_table_schema())
+                    .location(temp_path())
+                    .properties(HashMap::from([(TABLE_VERSION.into(), "2".into())]))
+                    .build(),
+            )
+            .await;
+
+        assert_eq!(refused.unwrap_err().kind(), ErrorKind::DataInvalid);
+        assert!(retained_versions(&catalog).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_definition_commit_publishes_the_next_version_with_its_pointer() {
+        let catalog = new_versioned_catalog().await;
+        let table = create_versioned_table(&catalog).await;
+        let first = table.metadata_location().unwrap().to_string();
+
+        let data_only = set_properties(&catalog, &table, &[("other", "x")])
+            .await
+            .unwrap();
+        assert_eq!(retained_versions(&catalog).await.len(), 1);
+
+        let edited = set_properties(&catalog, &data_only, &[
+            ("bloom", "foo"),
+            (TABLE_VERSION, "2"),
+        ])
+        .await
+        .unwrap();
+        let second = edited.metadata_location().unwrap().to_string();
+
+        assert_eq!(retained_versions(&catalog).await, vec![
+            (1, first),
+            (2, second.clone())
+        ]);
+        assert_eq!(
+            catalog
+                .load_metadata_location(table.identifier())
+                .await
+                .unwrap(),
+            Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn competing_definition_commits_from_one_version_yield_one_winner() {
+        let catalog = new_versioned_catalog().await;
+        let base = create_versioned_table(&catalog).await;
+
+        set_properties(&catalog, &base, &[
+            ("bloom", "winner"),
+            (TABLE_VERSION, "2"),
+        ])
+        .await
+        .unwrap();
+        let stale = set_properties(&catalog, &base, &[("bloom", "loser"), (TABLE_VERSION, "2")])
+            .await
+            .unwrap_err();
+
+        assert_eq!(stale.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(!stale.retryable(), "a stale definition edit never rebases");
+        assert_eq!(retained_versions(&catalog).await.len(), 2);
+        let current = catalog.load_table(base.identifier()).await.unwrap();
+        assert_eq!(
+            current.metadata().properties().get("bloom"),
+            Some(&"winner".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn data_only_head_movement_keeps_a_pending_definition_edit() {
+        let catalog = new_versioned_catalog().await;
+        let base = create_versioned_table(&catalog).await;
+        set_properties(&catalog, &base, &[("other", "x")])
+            .await
+            .unwrap();
+
+        let edited = set_properties(&catalog, &base, &[("bloom", "foo"), (TABLE_VERSION, "2")])
+            .await
+            .unwrap();
+
+        let properties = edited.metadata().properties();
+        assert_eq!(properties.get("other"), Some(&"x".to_string()));
+        assert_eq!(properties.get("bloom"), Some(&"foo".to_string()));
+        assert_eq!(properties.get(TABLE_VERSION), Some(&"2".to_string()));
+        assert_eq!(retained_versions(&catalog).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_version_changes_are_refused_without_a_reference() {
+        let catalog = new_versioned_catalog().await;
+        let table = create_versioned_table(&catalog).await;
+
+        for properties in [
+            vec![(TABLE_VERSION, "2")],
+            vec![("bloom", "foo"), (TABLE_VERSION, "3")],
+            vec![("bloom", "foo"), (TABLE_VERSION, "02")],
+            vec![("bloom", "foo"), (TABLE_VERSION, "+2")],
+            vec![("bloom", "foo"), (TABLE_VERSION, "9223372036854775808")],
+        ] {
+            assert!(
+                set_properties(&catalog, &table, &properties).await.is_err(),
+                "{properties:?} must be refused"
+            );
+        }
+        let removal = Transaction::new(&table);
+        let removed = removal
+            .update_table_properties()
+            .set("bloom".into(), "foo".into())
+            .remove(TABLE_VERSION.into())
+            .apply(removal)
+            .unwrap()
+            .commit_once(&catalog)
+            .await;
+
+        assert!(removed.is_err(), "the table version cannot be removed");
+        assert_eq!(retained_versions(&catalog).await.len(), 1);
     }
 }

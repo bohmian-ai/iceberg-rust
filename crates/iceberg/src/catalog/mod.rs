@@ -388,6 +388,11 @@ impl TableCommit {
         &self.ident
     }
 
+    /// Return the updates this commit applies.
+    pub fn updates(&self) -> &[TableUpdate] {
+        &self.updates
+    }
+
     /// Take all requirements.
     pub fn take_requirements(&mut self) -> Vec<TableRequirement> {
         take(&mut self.requirements)
