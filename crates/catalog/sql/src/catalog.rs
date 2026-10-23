@@ -405,7 +405,7 @@ impl SqlCatalog {
                 {CATALOG_FIELD_TABLE_NAMESPACE} VARCHAR(255) NOT NULL,
                 {CATALOG_FIELD_TABLE_NAME} VARCHAR(255) NOT NULL,
                 {TABLE_VERSION_FIELD_TABLE_UUID} VARCHAR(36) NOT NULL,
-                {TABLE_VERSION_FIELD_VERSION} BIGINT NOT NULL,
+                {TABLE_VERSION_FIELD_VERSION} BIGINT NOT NULL CHECK ({TABLE_VERSION_FIELD_VERSION} > 0),
                 {CATALOG_FIELD_METADATA_LOCATION_PROP} VARCHAR(1000) NOT NULL,
                 PRIMARY KEY ({CATALOG_FIELD_CATALOG_NAME}, {TABLE_VERSION_FIELD_TABLE_UUID}, {TABLE_VERSION_FIELD_VERSION}))"
         )))
@@ -523,13 +523,16 @@ impl SqlCatalog {
     /// definition.
     ///
     /// A commit that sets the configured property is a definition edit and
-    /// must carry at least one other update. Removing the property is refused.
+    /// must carry at least one other update. Removing the property, or
+    /// changing the current schema, default spec or default sort order without
+    /// setting it, is refused.
     fn requested_table_version(&self, updates: &[TableUpdate]) -> Result<Option<i64>> {
         let Some(property) = &self.table_version_property else {
             return Ok(None);
         };
         let mut requested = None;
         let mut other_updates = 0_usize;
+        let mut definition_updates = 0_usize;
         for update in updates {
             match update {
                 TableUpdate::SetProperties { updates } => {
@@ -547,8 +550,20 @@ impl SqlCatalog {
                     }
                     other_updates += removals.len();
                 }
+                TableUpdate::SetCurrentSchema { .. }
+                | TableUpdate::SetDefaultSpec { .. }
+                | TableUpdate::SetDefaultSortOrder { .. } => {
+                    definition_updates += 1;
+                    other_updates += 1;
+                }
                 _ => other_updates += 1,
             }
+        }
+        if requested.is_none() && definition_updates > 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("a definition edit must advance `{property}`"),
+            ));
         }
         if requested.is_some() && other_updates == 0 {
             return Err(Error::new(
@@ -2742,6 +2757,18 @@ mod tests {
             .await;
 
         assert!(removed.is_err(), "the table version cannot be removed");
+        let unversioned = Transaction::new(&table);
+        let unversioned = unversioned
+            .replace_sort_order()
+            .asc("foo", iceberg::spec::NullOrder::First)
+            .apply(unversioned)
+            .unwrap()
+            .commit_once(&catalog)
+            .await;
+        assert!(
+            unversioned.is_err(),
+            "a native definition edit must advance the table version"
+        );
         assert_eq!(retained_versions(&catalog).await.len(), 1);
     }
 }
