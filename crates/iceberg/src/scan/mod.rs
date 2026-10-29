@@ -66,17 +66,18 @@ pub struct TableScanBuilder<'a> {
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
-    concurrency_limit_data_files: usize,
-    concurrency_limit_manifest_entries: usize,
-    concurrency_limit_manifest_files: usize,
+    // Unset limits default to the host's parallelism, probed once in `build`
+    // and only when a limit is unset, so a caller that sets every limit
+    // never probes the host.
+    concurrency_limit_data_files: Option<usize>,
+    concurrency_limit_manifest_entries: Option<usize>,
+    concurrency_limit_manifest_files: Option<usize>,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
 }
 
 impl<'a> TableScanBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
-        let num_cpus = available_parallelism().get();
-
         Self {
             table,
             column_names: None,
@@ -87,9 +88,9 @@ impl<'a> TableScanBuilder<'a> {
             batch_size: None,
             case_sensitive: true,
             filter: None,
-            concurrency_limit_data_files: num_cpus,
-            concurrency_limit_manifest_entries: num_cpus,
-            concurrency_limit_manifest_files: num_cpus,
+            concurrency_limit_data_files: None,
+            concurrency_limit_manifest_entries: None,
+            concurrency_limit_manifest_files: None,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
         }
@@ -177,21 +178,21 @@ impl<'a> TableScanBuilder<'a> {
     /// Sets the concurrency limit for both manifest files and manifest
     /// entries for this scan
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
-        self.concurrency_limit_manifest_files = limit;
-        self.concurrency_limit_manifest_entries = limit;
-        self.concurrency_limit_data_files = limit;
+        self.concurrency_limit_manifest_files = Some(limit);
+        self.concurrency_limit_manifest_entries = Some(limit);
+        self.concurrency_limit_data_files = Some(limit);
         self
     }
 
     /// Sets the data file concurrency limit for this scan
     pub fn with_data_file_concurrency_limit(mut self, limit: usize) -> Self {
-        self.concurrency_limit_data_files = limit;
+        self.concurrency_limit_data_files = Some(limit);
         self
     }
 
     /// Sets the manifest entry concurrency limit for this scan
     pub fn with_manifest_entry_concurrency_limit(mut self, limit: usize) -> Self {
-        self.concurrency_limit_manifest_entries = limit;
+        self.concurrency_limit_manifest_entries = Some(limit);
         self
     }
 
@@ -229,6 +230,14 @@ impl<'a> TableScanBuilder<'a> {
 
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
+        let mut host = None;
+        let mut limit = |limit: Option<usize>| {
+            limit.unwrap_or_else(|| *host.get_or_insert_with(|| available_parallelism().get()))
+        };
+        let concurrency_limit_data_files = limit(self.concurrency_limit_data_files);
+        let concurrency_limit_manifest_entries = limit(self.concurrency_limit_manifest_entries);
+        let concurrency_limit_manifest_files = limit(self.concurrency_limit_manifest_files);
+
         let incremental_scan = match (self.from_snapshot_id, self.to_snapshot_id) {
             (Some(_), None) => {
                 return Err(Error::new(
@@ -274,9 +283,9 @@ impl<'a> TableScanBuilder<'a> {
                         column_names: self.column_names,
                         file_io: self.table.file_io().clone(),
                         plan_context: None,
-                        concurrency_limit_data_files: self.concurrency_limit_data_files,
-                        concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
-                        concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+                        concurrency_limit_data_files,
+                        concurrency_limit_manifest_entries,
+                        concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
                         runtime: self.table.runtime().clone(),
@@ -431,9 +440,9 @@ impl<'a> TableScanBuilder<'a> {
             column_names: self.column_names,
             file_io: self.table.file_io().clone(),
             plan_context: Some(plan_context),
-            concurrency_limit_data_files: self.concurrency_limit_data_files,
-            concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
-            concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+            concurrency_limit_data_files,
+            concurrency_limit_manifest_entries,
+            concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             runtime: self.table.runtime().clone(),
@@ -1935,6 +1944,26 @@ pub mod tests {
             .build()
             .unwrap();
         assert_eq!(Some(vec!["z".to_string()]), table_scan.column_names);
+    }
+
+    #[tokio::test]
+    async fn test_table_scan_concurrency_limits() {
+        let table = TableTestFixture::new().table;
+
+        let table_scan = table.scan().with_concurrency_limit(3).build().unwrap();
+        assert_eq!(3, table_scan.concurrency_limit_data_files);
+        assert_eq!(3, table_scan.concurrency_limit_manifest_entries);
+        assert_eq!(3, table_scan.concurrency_limit_manifest_files);
+
+        let host = crate::util::available_parallelism().get();
+        let table_scan = table
+            .scan()
+            .with_data_file_concurrency_limit(2)
+            .build()
+            .unwrap();
+        assert_eq!(2, table_scan.concurrency_limit_data_files);
+        assert_eq!(host, table_scan.concurrency_limit_manifest_entries);
+        assert_eq!(host, table_scan.concurrency_limit_manifest_files);
     }
 
     #[tokio::test]
