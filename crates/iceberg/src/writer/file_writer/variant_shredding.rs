@@ -39,12 +39,21 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::temporal_conversions::time64us_to_time;
+use arrow_array::types::{
+    Date32Type, Decimal32Type, Decimal64Type, Decimal128Type, Time64MicrosecondType,
+    TimestampMicrosecondType, TimestampNanosecondType,
+};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{DataType, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
+use chrono::{DateTime, Timelike};
 use parquet::file::metadata::ParquetMetaData;
+#[cfg(doc)]
+use parquet::variant::unshred_variant;
 use parquet::variant::{
-    ShreddedSchemaBuilder, Variant, VariantArray, VariantPath, VariantPathElement, shred_variant,
-    unshred_variant,
+    ShreddedSchemaBuilder, Variant, VariantArray, VariantDecimal4, VariantDecimal8,
+    VariantDecimal16, VariantDecimalType, VariantMetadata, VariantObject, VariantPath,
+    VariantPathElement, shred_variant,
 };
 
 use super::{FileWriter, FileWriterBuilder, ParquetWriter, ParquetWriterBuilder};
@@ -649,21 +658,33 @@ impl VariantLayoutAnalyzer {
 
     /// Adds the `chosen` rows of `batch`, each with its sampling stratum, to the counters.
     ///
+    /// Each chosen value is read in place through a [`Reader`], so a shredded
+    /// value is counted exactly as its reconstructed value would be without
+    /// copying or encoding its payload.
+    ///
     /// # Errors
     ///
-    /// Returns an error when a Variant field is missing from `batch` or is not Variant storage.
+    /// Returns an error when a Variant field is missing from `batch`, is not
+    /// Variant storage, or a chosen value is not valid Variant data.
     fn observe(&mut self, batch: &RecordBatch, chosen: &[(usize, usize)]) -> Result<()> {
         for sample in &mut self.columns {
-            let (variant, values) = sample.values(batch, chosen)?;
+            let (array, values) = sample.values(batch, chosen)?;
+            let variant = VariantArray::try_new(array.as_ref()).map_err(variant_error)?;
+            let reader = Reader::try_new(variant.inner())?;
             for (index, stratum) in values {
                 if variant.is_null(index) {
                     continue;
                 }
+                let metadata = binary(variant.metadata_column().as_ref(), index)?;
+                let metadata = VariantMetadata::try_new(metadata).map_err(variant_error)?;
                 *sample.roots.entry(stratum).or_default() += 1;
-                if let Variant::Object(object) = variant.value(index) {
-                    sample
-                        .node
-                        .observe_object(&object, 1, stratum, &self.policy);
+                match reader.read(metadata, index)? {
+                    Logical::Object(object) => {
+                        sample
+                            .node
+                            .observe_object(&object, 1, stratum, &self.policy)?
+                    }
+                    value => value.check()?,
                 }
             }
         }
@@ -699,23 +720,23 @@ impl VariantLayoutAnalyzer {
 }
 
 impl ColumnSample {
-    /// The field's Variant values in the `chosen` rows of `batch`: the
-    /// Variant array and the index and stratum of each value.
+    /// The field's Variant storage in `batch` with the index and stratum of
+    /// each of its values in the `chosen` rows.
     ///
     /// The walk follows the path from the top-level column: a Struct step
     /// keeps the values whose Struct is valid, and a List step expands each
     /// valid List into its elements, so a row inside a List holds one value
-    /// per element.
+    /// per element. No value is copied.
     ///
     /// # Errors
     ///
-    /// Returns an error when the path is missing from `batch` or does not end
-    /// at Variant storage.
+    /// Returns an error when the path is missing from `batch` or crosses a
+    /// type other than Struct or List.
     fn values(
         &self,
         batch: &RecordBatch,
         chosen: &[(usize, usize)],
-    ) -> Result<(VariantArray, Vec<(usize, usize)>)> {
+    ) -> Result<(ArrayRef, Vec<(usize, usize)>)> {
         let missing = || {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -749,22 +770,464 @@ impl ColumnSample {
                 _ => return Err(missing()),
             };
         }
-        let variant = VariantArray::try_new(array.as_ref()).map_err(variant_error)?;
-        if variant.typed_value_column().is_none() {
-            return Ok((variant, values));
+        Ok((array, values))
+    }
+}
+
+/// Reads logical Variant values in place from one `value`/`typed_value`
+/// pair, at the top level or of a shredded object field or list element.
+///
+/// It follows [`unshred_variant`]'s reconstruction exactly, built once per
+/// array from the physical type: it accepts the same shredding types, rejects
+/// the same per-value contents, and gives each value the type its
+/// reconstruction would have. A value is reported only as sampling counts it,
+/// so no payload is copied or encoded: missing, null, a scalar family, a list,
+/// or an object's fields in name order.
+enum Reader<'a> {
+    /// Neither column, so every value is missing.
+    Absent,
+    /// Only the residual `value` column.
+    Value(&'a dyn Array),
+    /// A `typed_value` column, and the residual `value` column when present.
+    Typed {
+        /// Residual Variant bytes.
+        value: Option<&'a dyn Array>,
+        /// Shredded values.
+        typed: Typed<'a>,
+    },
+}
+
+/// The `typed_value` column of a [`Reader`].
+enum Typed<'a> {
+    /// A shredded scalar.
+    Leaf(&'a dyn Array, Leaf),
+    /// A shredded object; its fields sorted by name, as a reconstructed
+    /// object orders them.
+    Object(&'a StructArray, Vec<(&'a str, Reader<'a>)>),
+    /// A shredded array whose elements `element` reads; `elements` gives the
+    /// element range of a value.
+    List(&'a dyn Array, Box<Reader<'a>>),
+}
+
+/// How a shredded scalar column reconstructs.
+#[derive(Clone, Copy)]
+enum Leaf {
+    /// Every value has this family.
+    Fixed(Scalar),
+    /// Days since the epoch, which must be a valid date.
+    Date,
+    /// Microseconds since midnight, which must be a valid time.
+    Time,
+    /// Instants in microseconds or `nanos`, adjusted to UTC when `utc`.
+    Timestamp { nanos: bool, utc: bool },
+    /// Decimals of this many bytes and signed scale.
+    Decimal { bytes: u8, scale: i8 },
+}
+
+/// One logical Variant value as the sampler counts it.
+enum Logical<'r, 'a> {
+    /// No value: an object field that is absent.
+    Missing,
+    /// A Variant null.
+    Null,
+    /// A scalar of this family.
+    Scalar(Scalar),
+    /// An array; its elements are never counted.
+    List,
+    /// An object.
+    Object(LogicalObject<'r, 'a>),
+}
+
+/// The fields of one logical object: shredded fields merged with the fields
+/// of its residual object.
+struct LogicalObject<'r, 'a> {
+    /// Metadata of the value's row.
+    metadata: VariantMetadata<'a>,
+    /// Shredded fields sorted by name; empty for a residual-only object.
+    typed: &'r [(&'a str, Reader<'a>)],
+    /// Index of the value in the shredded field columns.
+    index: usize,
+    /// Fully validated residual fields, sorted by name.
+    residual: Option<VariantObject<'a, 'a>>,
+}
+
+impl<'a> Reader<'a> {
+    /// A reader of the `value`/`typed_value` pair `pair`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a shredding type [`unshred_variant`] rejects or a
+    /// residual `value` column that is not binary.
+    fn try_new(pair: &'a StructArray) -> Result<Self> {
+        let value = match pair.column_by_name("value") {
+            Some(value) => {
+                binary_type(value.data_type())?;
+                Some(value.as_ref())
+            }
+            None => None,
+        };
+        let Some(typed) = pair.column_by_name("typed_value") else {
+            return Ok(value.map_or(Reader::Absent, Reader::Value));
+        };
+        let invalid = |what: String| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("{what} is not a valid Variant shredding type."),
+            )
+        };
+        let fixed = |scalar| Typed::Leaf(typed.as_ref(), Leaf::Fixed(scalar));
+        let leaf = |leaf| Typed::Leaf(typed.as_ref(), leaf);
+        let decimal = |bytes, max: u8, precision: u8, scale: i8| {
+            if precision == 0 || precision > max || scale.unsigned_abs() > precision {
+                return Err(invalid(typed.data_type().to_string()));
+            }
+            Ok(leaf(Leaf::Decimal { bytes, scale }))
+        };
+        let typed = match typed.data_type() {
+            DataType::Boolean => fixed(Scalar::Boolean),
+            DataType::Int8 => fixed(Scalar::Int(1)),
+            DataType::Int16 => fixed(Scalar::Int(2)),
+            DataType::Int32 => fixed(Scalar::Int(4)),
+            DataType::Int64 => fixed(Scalar::Int(8)),
+            DataType::Float32 => fixed(Scalar::Float),
+            DataType::Float64 => fixed(Scalar::Double),
+            DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => fixed(Scalar::String),
+            DataType::Binary | DataType::BinaryView | DataType::LargeBinary => {
+                fixed(Scalar::Binary)
+            }
+            DataType::FixedSizeBinary(16) => fixed(Scalar::Uuid),
+            DataType::Date32 => leaf(Leaf::Date),
+            DataType::Time64(TimeUnit::Microsecond) => leaf(Leaf::Time),
+            DataType::Timestamp(unit @ (TimeUnit::Microsecond | TimeUnit::Nanosecond), zone) => {
+                leaf(Leaf::Timestamp {
+                    nanos: *unit == TimeUnit::Nanosecond,
+                    utc: zone.is_some(),
+                })
+            }
+            DataType::Decimal32(precision, scale) => decimal(4, 9, *precision, *scale)?,
+            DataType::Decimal64(precision, scale) => decimal(8, 18, *precision, *scale)?,
+            DataType::Decimal128(precision, scale) => decimal(16, 38, *precision, *scale)?,
+            DataType::Struct(_) => {
+                let object = typed.as_struct();
+                let mut fields = object
+                    .fields()
+                    .iter()
+                    .zip(object.columns())
+                    .map(|(field, column)| {
+                        let Some(column) = column.as_struct_opt() else {
+                            return Err(invalid(format!("Object field {}", field.name())));
+                        };
+                        Ok((field.name().as_str(), Reader::try_new(column)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                fields.sort_by_key(|(name, _)| *name);
+                Typed::Object(object, fields)
+            }
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::FixedSizeList(..) => {
+                let Some(element) = list_values(typed.as_ref()).as_struct_opt() else {
+                    return Err(invalid("List element".to_owned()));
+                };
+                Typed::List(typed.as_ref(), Box::new(Reader::try_new(element)?))
+            }
+            other => return Err(invalid(other.to_string())),
+        };
+        Ok(Reader::Typed { value, typed })
+    }
+
+    /// The value at `index`, whose row has `metadata`.
+    ///
+    /// The typed value wins over the residual one; with neither the value is
+    /// missing. A scalar or list is fully checked here, an object's fields as
+    /// they are read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when residual bytes are not valid Variant, a typed
+    /// scalar is out of range, a scalar or list has both a typed and a
+    /// residual value, or a partially shredded object's residual value is not
+    /// an object.
+    fn read<'r>(&'r self, metadata: VariantMetadata<'a>, index: usize) -> Result<Logical<'r, 'a>> {
+        let residual = |value: Option<&'a dyn Array>| -> Result<Option<Variant<'a, 'a>>> {
+            match value {
+                Some(value) if value.is_valid(index) => Ok(Some(
+                    Variant::try_new_with_metadata(metadata.clone(), binary(value, index)?)
+                        .map_err(variant_error)?,
+                )),
+                _ => Ok(None),
+            }
+        };
+        let (value, typed) = match self {
+            Reader::Absent => return Ok(Logical::Missing),
+            Reader::Value(value) => {
+                return Ok(residual(Some(*value))?.map_or(Logical::Missing, Logical::of));
+            }
+            Reader::Typed { value, typed } => (residual(*value)?, typed),
+        };
+        let (Typed::Leaf(array, _) | Typed::List(array, _)) = typed else {
+            let Typed::Object(array, fields) = typed else {
+                unreachable!("every typed column is a leaf, list, or object");
+            };
+            if array.is_null(index) {
+                return Ok(value.map_or(Logical::Missing, Logical::of));
+            }
+            let residual = match value {
+                None => None,
+                Some(Variant::Object(object)) => Some(object),
+                Some(_) => {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        "A partially shredded Variant object has a residual value that is not an object.",
+                    ));
+                }
+            };
+            return Ok(Logical::Object(LogicalObject {
+                metadata,
+                typed: fields,
+                index,
+                residual,
+            }));
+        };
+        if array.is_null(index) {
+            return Ok(value.map_or(Logical::Missing, Logical::of));
         }
-        // A shredded field is reconstructed only at the chosen values, so
-        // sampling a learned layout costs the sample rather than the input.
-        let indices = UInt64Array::from_iter_values(values.iter().map(|&(index, _)| index as u64));
-        let chosen =
-            arrow_select::take::take(variant.inner(), &indices, None).map_err(variant_error)?;
-        let chosen = VariantArray::try_new(chosen.as_ref()).map_err(variant_error)?;
-        let values = values
-            .into_iter()
-            .enumerate()
-            .map(|(row, (_, stratum))| (row, stratum))
-            .collect();
-        Ok((unshred_variant(&chosen).map_err(variant_error)?, values))
+        if value.is_some() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "A shredded Variant value has both a typed and a residual value.",
+            ));
+        }
+        match typed {
+            Typed::Leaf(array, leaf) => Ok(Logical::Scalar(leaf.scalar(*array, index)?)),
+            Typed::List(array, element) => {
+                for element_index in list_range(*array, index) {
+                    match element.read(metadata.clone(), element_index)? {
+                        Logical::Missing => {}
+                        value => value.check()?,
+                    }
+                }
+                Ok(Logical::List)
+            }
+            Typed::Object(..) => unreachable!("objects return above"),
+        }
+    }
+}
+
+impl Leaf {
+    /// The family of the value at `index` of `array`, which is not null.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be represented in Variant.
+    fn scalar(self, array: &dyn Array, index: usize) -> Result<Scalar> {
+        let out_of_range = |what: &str| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Invalid shredded Variant {what} value."),
+            )
+        };
+        Ok(match self {
+            Leaf::Fixed(scalar) => scalar,
+            Leaf::Date => {
+                let days = array.as_primitive::<Date32Type>().value(index);
+                Date32Type::to_naive_date_opt(days).ok_or_else(|| out_of_range("date"))?;
+                Scalar::Date
+            }
+            Leaf::Time => {
+                let micros = array.as_primitive::<Time64MicrosecondType>().value(index);
+                time64us_to_time(micros).ok_or_else(|| out_of_range("time"))?;
+                Scalar::Time
+            }
+            Leaf::Timestamp { nanos: false, utc } => {
+                let micros = array
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .value(index);
+                DateTime::from_timestamp_micros(micros).ok_or_else(|| out_of_range("timestamp"))?;
+                Scalar::Timestamp { nanos: false, utc }
+            }
+            Leaf::Timestamp { nanos: true, utc } => {
+                let nanos = array.as_primitive::<TimestampNanosecondType>().value(index);
+                Scalar::Timestamp {
+                    nanos: !DateTime::from_timestamp_nanos(nanos)
+                        .nanosecond()
+                        .is_multiple_of(1000),
+                    utc,
+                }
+            }
+            Leaf::Decimal { bytes, scale } => {
+                let scale = match bytes {
+                    4 => VariantDecimal4::try_new_with_signed_scale(
+                        array.as_primitive::<Decimal32Type>().value(index),
+                        scale,
+                    )
+                    .map(|decimal| decimal.scale()),
+                    8 => VariantDecimal8::try_new_with_signed_scale(
+                        array.as_primitive::<Decimal64Type>().value(index),
+                        scale,
+                    )
+                    .map(|decimal| decimal.scale()),
+                    _ => VariantDecimal16::try_new_with_signed_scale(
+                        array.as_primitive::<Decimal128Type>().value(index),
+                        scale,
+                    )
+                    .map(|decimal| decimal.scale()),
+                }
+                .map_err(variant_error)?;
+                Scalar::decimal(bytes_precision(bytes), scale)
+            }
+        })
+    }
+}
+
+/// The largest precision of a Variant decimal of `bytes` bytes.
+const fn bytes_precision(bytes: u8) -> u8 {
+    match bytes {
+        4 => 9,
+        8 => 18,
+        _ => 38,
+    }
+}
+
+impl<'r, 'a> Logical<'r, 'a> {
+    /// The logical form of a validated residual `value`.
+    fn of(value: Variant<'a, 'a>) -> Self {
+        match value {
+            Variant::Null => Logical::Null,
+            Variant::List(_) => Logical::List,
+            Variant::Object(object) => Logical::Object(LogicalObject {
+                metadata: object.metadata.clone(),
+                typed: &[],
+                index: 0,
+                residual: Some(object),
+            }),
+            scalar => Scalar::of(&scalar).map_or(Logical::Null, Logical::Scalar),
+        }
+    }
+
+    /// Checks the parts of this value not yet read, which the sampler does
+    /// not count: the shredded fields of an object, at any depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Reader::read`] and [`LogicalObject::fields`].
+    fn check(self) -> Result<()> {
+        match self {
+            Logical::Object(object) if !object.typed.is_empty() => {
+                object.fields(|_, value| value.check())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<'r, 'a> LogicalObject<'r, 'a> {
+    /// Calls `visit` with each present field and its value, in name order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error of `visit` or [`Reader::read`], or an error
+    /// when a residual field repeats a shredded field's name.
+    fn fields(&self, mut visit: impl FnMut(&'a str, Logical<'r, 'a>) -> Result<()>) -> Result<()> {
+        let mut residual = self
+            .residual
+            .iter()
+            .flat_map(|object| object.iter())
+            .peekable();
+        for (name, reader) in self.typed {
+            while let Some((field, value)) = residual.next_if(|(field, _)| field < name) {
+                visit(field, Logical::of(value))?;
+            }
+            if residual.next_if(|(field, _)| field == name).is_some() {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Variant field '{name}' is both shredded and residual."),
+                ));
+            }
+            match reader.read(self.metadata.clone(), self.index)? {
+                Logical::Missing => {}
+                value => visit(name, value)?,
+            }
+        }
+        residual.try_for_each(|(field, value)| visit(field, Logical::of(value)))
+    }
+}
+
+/// Fails unless `data_type` holds Variant bytes.
+///
+/// # Errors
+///
+/// Returns an error for any type but Binary, LargeBinary, or BinaryView.
+fn binary_type(data_type: &DataType) -> Result<()> {
+    match data_type {
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Ok(()),
+        // ponytail: dictionary or run-end encoded Variant bytes, which
+        // `unshred_variant` decodes, are rejected; Wyrd never writes them.
+        other => Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Variant bytes must be binary, not {other}."),
+        )),
+    }
+}
+
+/// The Variant bytes at `index` of `array`, which is not null.
+///
+/// # Errors
+///
+/// Returns the error of [`binary_type`].
+fn binary(array: &dyn Array, index: usize) -> Result<&[u8]> {
+    binary_type(array.data_type())?;
+    Ok(match array.data_type() {
+        DataType::Binary => array.as_binary::<i32>().value(index),
+        DataType::LargeBinary => array.as_binary::<i64>().value(index),
+        _ => array.as_binary_view().value(index),
+    })
+}
+
+/// The element values of a list-like `array`.
+fn list_values(array: &dyn Array) -> &ArrayRef {
+    match array.data_type() {
+        DataType::List(_) => array.as_list::<i32>().values(),
+        DataType::LargeList(_) => array.as_list::<i64>().values(),
+        DataType::ListView(_) => array.as_list_view::<i32>().values(),
+        DataType::LargeListView(_) => array.as_list_view::<i64>().values(),
+        _ => array.as_fixed_size_list().values(),
+    }
+}
+
+/// The element range of the list at `index` of a list-like `array`.
+fn list_range(array: &dyn Array, index: usize) -> Range<usize> {
+    let span = |offset: usize, len: usize| offset..offset + len;
+    match array.data_type() {
+        DataType::List(_) => {
+            let offsets = array.as_list::<i32>().value_offsets();
+            offsets[index] as usize..offsets[index + 1] as usize
+        }
+        DataType::LargeList(_) => {
+            let offsets = array.as_list::<i64>().value_offsets();
+            offsets[index] as usize..offsets[index + 1] as usize
+        }
+        DataType::ListView(_) => {
+            let list = array.as_list_view::<i32>();
+            span(
+                list.value_offsets()[index] as usize,
+                list.value_sizes()[index] as usize,
+            )
+        }
+        DataType::LargeListView(_) => {
+            let list = array.as_list_view::<i64>();
+            span(
+                list.value_offsets()[index] as usize,
+                list.value_sizes()[index] as usize,
+            )
+        }
+        _ => {
+            let list = array.as_fixed_size_list();
+            let len = list.value_length() as usize;
+            span(index * len, len)
+        }
     }
 }
 
@@ -852,14 +1315,18 @@ enum Scalar {
 
 impl ObjectNode {
     /// Records the children of one object value at `depth`, sampled in `stratum`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of reading the object's fields.
     fn observe_object(
         &mut self,
-        object: &parquet::variant::VariantObject<'_, '_>,
+        object: &LogicalObject<'_, '_>,
         depth: usize,
         stratum: usize,
         policy: &VariantShreddingPolicy,
-    ) {
-        for (name, value) in object.iter() {
+    ) -> Result<()> {
+        object.fields(|name, value| {
             let tracked = self.children.len();
             let child = match self.children.get_mut(name) {
                 Some(child) => child,
@@ -867,14 +1334,14 @@ impl ObjectNode {
                     .children
                     .entry(name.to_owned())
                     .or_insert_with(Child::new),
-                None => continue,
+                None => return value.check(),
             };
-            if matches!(value, Variant::Null) {
-                continue;
+            if matches!(value, Logical::Null) {
+                return Ok(());
             }
             *child.counts.entry(stratum).or_default() += 1;
-            child.family.merge(&value, depth + 1, stratum, policy);
-        }
+            child.family.merge(value, depth + 1, stratum, policy)
+        })
     }
 
     /// Records `count` rows holding the scalar leaf at `path` with type `scalar`.
@@ -966,35 +1433,46 @@ impl ObjectNode {
 
 impl Family {
     /// Merges one non-null value observed at `depth` in `stratum` into this family.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of reading the value's fields.
     fn merge(
         &mut self,
-        value: &Variant<'_, '_>,
+        value: Logical<'_, '_>,
         depth: usize,
         stratum: usize,
         policy: &VariantShreddingPolicy,
-    ) {
+    ) -> Result<()> {
         match (&mut *self, value) {
-            (Family::Residual, _) => {}
-            (_, Variant::List(_)) => *self = Family::Residual,
-            (_, Variant::Object(_)) if depth > policy.max_depth => *self = Family::Residual,
-            (Family::Unknown, Variant::Object(object)) => {
+            (Family::Residual, value) => return value.check(),
+            (_, Logical::List) => *self = Family::Residual,
+            (_, value @ Logical::Object(_)) if depth > policy.max_depth => {
+                *self = Family::Residual;
+                return value.check();
+            }
+            (Family::Unknown, Logical::Object(object)) => {
                 let mut node = ObjectNode::default();
-                node.observe_object(object, depth, stratum, policy);
+                node.observe_object(&object, depth, stratum, policy)?;
                 *self = Family::Object(node);
             }
-            (Family::Object(node), Variant::Object(object)) => {
-                node.observe_object(object, depth, stratum, policy)
+            (Family::Object(node), Logical::Object(object)) => {
+                node.observe_object(&object, depth, stratum, policy)?
             }
-            (Family::Object(_), _) => *self = Family::Residual,
-            (Family::Unknown, scalar) => {
-                *self = Scalar::of(scalar).map_or(Family::Residual, Family::Scalar)
+            (Family::Object(_), Logical::Scalar(_)) => *self = Family::Residual,
+            (Family::Scalar(_), value @ Logical::Object(_)) => {
+                *self = Family::Residual;
+                return value.check();
             }
-            (Family::Scalar(current), scalar) => {
-                *self = Scalar::of(scalar)
-                    .and_then(|next| current.widen(next))
+            (Family::Unknown, Logical::Scalar(scalar)) => *self = Family::Scalar(scalar),
+            (Family::Scalar(current), Logical::Scalar(scalar)) => {
+                *self = current
+                    .widen(scalar)
                     .map_or(Family::Residual, Family::Scalar)
             }
+            (_, Logical::Null | Logical::Missing) => {}
         }
+        Ok(())
     }
 }
 
@@ -1247,7 +1725,7 @@ mod tests {
     use bytes::Bytes;
     use parquet::arrow::ArrowWriter;
     use parquet::file::metadata::ParquetMetaDataReader;
-    use parquet::variant::json_to_variant;
+    use parquet::variant::{json_to_variant, unshred_variant};
 
     use super::*;
 
@@ -1474,8 +1952,8 @@ mod tests {
         let observe = |node: &mut ObjectNode, json: &str, stratum: usize| {
             let batch = variant_batch(&[Some(json)]);
             let variant = VariantArray::try_new(batch.column(0).as_ref()).unwrap();
-            if let Variant::Object(object) = variant.value(0) {
-                node.observe_object(&object, 1, stratum, &policy);
+            if let Logical::Object(object) = Logical::of(variant.value(0)) {
+                node.observe_object(&object, 1, stratum, &policy).unwrap();
             }
         };
         observe(&mut node, r#"{"x":1}"#, 0);
@@ -1628,7 +2106,7 @@ mod tests {
             Arc::new(arrow_schema::Field::new("name", DataType::Utf8, true)),
             Arc::new(attributes.field("attributes")),
         ]);
-        let structs = arrow_array::StructArray::try_new(
+        let structs = StructArray::try_new(
             element.clone(),
             vec![
                 Arc::new(StringArray::from(vec!["e"; documents.len()])),
@@ -1760,6 +2238,210 @@ mod tests {
             VariantLayout::combine(&schema, &[], &POLICY)
                 .unwrap()
                 .is_unshredded()
+        );
+    }
+
+    /// Counts the bytes this thread allocates, so a test can tell what one
+    /// call allocates without other threads' noise.
+    struct CountingAllocator;
+
+    thread_local! {
+        static ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Adds `bytes` to this thread's count; a thread being torn down is not counted.
+    fn count(bytes: usize) {
+        let _ = ALLOCATED.try_with(|allocated| allocated.set(allocated.get() + bytes));
+    }
+
+    // SAFETY: every call forwards unchanged to the system allocator.
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count(layout.size());
+            // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count(layout.size());
+            // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s contract.
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            count(new_size);
+            // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract.
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    /// Rows kept per stratum, sampled roots per field, and the layout of one
+    /// sampler offered `batches`, each a batch and its first position, as one
+    /// stratum of `rows` rows.
+    fn counters(
+        batches: &[(&RecordBatch, u64)],
+        rows: usize,
+        policy: VariantShreddingPolicy,
+    ) -> Result<(Vec<usize>, Vec<BTreeMap<usize, usize>>, VariantLayout)> {
+        let mut sampler = VariantSampler::new(&batches[0].0.schema(), policy, 5, &[rows]);
+        for (batch, first) in batches {
+            sampler.offer(batch, &vec![0; batch.num_rows()], *first)?;
+        }
+        let roots = sampler
+            .analyzer
+            .columns
+            .iter()
+            .map(|column| column.roots.clone())
+            .collect();
+        Ok((sampler.kept.clone(), roots, sampler.layout()))
+    }
+
+    /// A shredded or mixed input reads its chosen values in place: it selects
+    /// the same rows and counts the same fields as its logical values, through
+    /// typed/residual overlap, residual-only fields, nulls, missing fields,
+    /// type conflicts, nested objects, and lists; malformed storage still
+    /// fails; and longer payloads allocate nothing more.
+    #[test]
+    fn physical_sample_counts_without_payload_reconstruction() {
+        // Every field seen once is kept, so the layout shows every count.
+        let every = VariantShreddingPolicy {
+            min_frequency: 0.0,
+            ..POLICY
+        };
+        let documents = [
+            r#"{"a":1,"o":{"x":2,"y":"r"},"new":"t"}"#,
+            r#"{"a":"conflict","o":{"x":"s"}}"#,
+            r#"{"a":null,"o":null}"#,
+            r#"{"o":{"x":1.5}}"#,
+            r#"{"a":300,"o":[1,2]}"#,
+            r#"{"z":{"deep":{"k":true}},"o":{}}"#,
+            r#""scalar""#,
+            r#"[1,{"a":1}]"#,
+            "null",
+        ];
+        let json: Vec<Option<&str>> = (0..400)
+            .map(|row| (row % 10 != 9).then(|| documents[row % documents.len()]))
+            .collect();
+        let logical = variant_batch(&json);
+        let seed = variant_batch(&[Some(r#"{"a":1,"o":{"x":1}}"#)]);
+        let layout = sample(&seed, &[0], POLICY, 7);
+        assert_eq!(names(layout.shredding_type(&["v"])), ["a", "o"]);
+        let shredded = layout.shred(&logical).unwrap();
+        assert_ne!(shredded.schema(), logical.schema());
+        let expected = counters(&[(&logical, 0)], 400, every).unwrap();
+        assert!(expected.0[0] > 300, "{:?}", expected.0);
+        assert!(names(expected.2.shredding_type(&["v"])).contains(&"new".to_owned()));
+        assert_eq!(counters(&[(&shredded, 0)], 400, every).unwrap(), expected);
+        let (head, tail) = (logical.slice(0, 200), shredded.slice(200, 200));
+        let mixed = layout.shred(&head).unwrap();
+        assert_eq!(
+            counters(&[(&head, 0), (&tail, 200)], 400, every).unwrap(),
+            expected,
+            "canonical then shredded"
+        );
+        assert_eq!(
+            counters(&[(&mixed, 0), (&logical.slice(200, 200), 200)], 400, every).unwrap(),
+            expected,
+            "shredded then canonical"
+        );
+
+        let row: &[&str] = &[r#"{"k":1,"s":"a"}"#, r#"{"k":"two","rare":[true]}"#];
+        let events = events_batch(&vec![row; 40]);
+        let only_k = sample(&events_batch(&[&[r#"{"k":1}"#]]), &[0], POLICY, 7);
+        let rows = events.num_rows();
+        assert_eq!(
+            counters(&[(&only_k.shred(&events).unwrap(), 0)], rows, every).unwrap(),
+            counters(&[(&events, 0)], rows, every).unwrap()
+        );
+
+        // Malformed storage fails as reconstruction does: a residual that is
+        // not an object, and a residual repeating a shredded field.
+        let only_a = sample(&variant_batch(&[Some(r#"{"a":1}"#)]), &[0], POLICY, 7);
+        let valid = only_a.shred(&variant_batch(&[Some(r#"{"a":1}"#)])).unwrap();
+        for residual in [r#"5"#, r#"{"a":2}"#] {
+            let residual = variant_batch(&[Some(residual)]);
+            let residual = residual
+                .column(0)
+                .as_struct()
+                .column_by_name("value")
+                .unwrap();
+            let storage = valid.column(0).as_struct();
+            let columns = storage
+                .fields()
+                .iter()
+                .zip(storage.columns())
+                .map(|(field, column)| match field.name().as_str() {
+                    "value" => Arc::clone(residual),
+                    _ => Arc::clone(column),
+                })
+                .collect();
+            let fields = storage
+                .fields()
+                .iter()
+                .map(|field| match field.name().as_str() {
+                    "value" => Arc::new(
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_data_type(residual.data_type().clone()),
+                    ),
+                    _ => Arc::clone(field),
+                })
+                .collect::<Fields>();
+            let storage = StructArray::try_new(fields, columns, None).unwrap();
+            let schema = Schema::new(vec![
+                valid
+                    .schema()
+                    .field(0)
+                    .clone()
+                    .with_data_type(storage.data_type().clone()),
+            ]);
+            let malformed =
+                RecordBatch::try_new(Arc::new(schema), vec![Arc::new(storage)]).unwrap();
+            let variant = VariantArray::try_new(malformed.column(0).as_ref()).unwrap();
+            assert!(
+                unshred_variant(&variant).is_err(),
+                "reconstruction rejects it"
+            );
+            assert!(
+                counters(&[(&malformed, 0)], 1, every).is_err(),
+                "sampling rejects it"
+            );
+        }
+
+        // Reading a chosen value allocates nothing for its typed or residual payload.
+        let offered = |payload: usize| {
+            let text = "p".repeat(payload);
+            let documents: Vec<String> = (0..100)
+                .map(|row| format!(r#"{{"s":"{text}","r":"{text}","n":{row}}}"#))
+                .collect();
+            let json: Vec<Option<&str>> = documents.iter().map(|doc| Some(doc.as_str())).collect();
+            let only_s = sample(&variant_batch(&[Some(r#"{"s":"x"}"#)]), &[0], POLICY, 7);
+            let batch = only_s.shred(&variant_batch(&json)).unwrap();
+            let mut sampler = VariantSampler::new(&batch.schema(), POLICY, 5, &[100]);
+            let before = ALLOCATED.with(std::cell::Cell::get);
+            sampler.offer(&batch, &[0; 100], 0).unwrap();
+            let allocated = ALLOCATED.with(std::cell::Cell::get) - before;
+            assert!(sampler.sampled_rows() > 90, "{}", sampler.sampled_rows());
+            allocated
+        };
+        let (short, long) = (offered(16), offered(64 * 1024));
+        assert!(
+            long.saturating_sub(short) < 64 * 1024,
+            "a longer payload allocated {short} then {long} bytes"
         );
     }
 }
