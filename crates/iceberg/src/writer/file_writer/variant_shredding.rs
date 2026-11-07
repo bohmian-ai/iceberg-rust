@@ -39,11 +39,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::variant::{
     ShreddedSchemaBuilder, Variant, VariantArray, VariantPath, VariantPathElement, shred_variant,
+    unshred_variant,
 };
 
 use super::{FileWriter, FileWriterBuilder, ParquetWriter, ParquetWriterBuilder};
@@ -526,7 +527,9 @@ impl VariantSampler {
     /// Offers every row of `batch`; row `i` is in caller stratum `strata[i]` at position `first_position + i`.
     ///
     /// `batch` needs only the columns [`Self::column_names`] names, found by
-    /// name; other columns are ignored.
+    /// name; other columns are ignored. A Variant field may be shredded in any
+    /// layout: only the values the sample keeps are reconstructed, so they are
+    /// counted exactly as their unshredded values would be.
     ///
     /// # Errors
     ///
@@ -559,6 +562,11 @@ impl VariantSampler {
             }
         }
         self.analyzer.observe(batch, &chosen)
+    }
+
+    /// Rows the sample has kept so far, over every stratum.
+    pub fn sampled_rows(&self) -> usize {
+        self.kept.iter().sum()
     }
 
     /// The layout the sample supports.
@@ -741,10 +749,22 @@ impl ColumnSample {
                 _ => return Err(missing()),
             };
         }
-        Ok((
-            VariantArray::try_new(array.as_ref()).map_err(variant_error)?,
-            values,
-        ))
+        let variant = VariantArray::try_new(array.as_ref()).map_err(variant_error)?;
+        if variant.typed_value_column().is_none() {
+            return Ok((variant, values));
+        }
+        // A shredded field is reconstructed only at the chosen values, so
+        // sampling a learned layout costs the sample rather than the input.
+        let indices = UInt64Array::from_iter_values(values.iter().map(|&(index, _)| index as u64));
+        let chosen =
+            arrow_select::take::take(variant.inner(), &indices, None).map_err(variant_error)?;
+        let chosen = VariantArray::try_new(chosen.as_ref()).map_err(variant_error)?;
+        let values = values
+            .into_iter()
+            .enumerate()
+            .map(|(row, (_, stratum))| (row, stratum))
+            .collect();
+        Ok((unshred_variant(&chosen).map_err(variant_error)?, values))
     }
 }
 
@@ -1403,6 +1423,46 @@ mod tests {
         assert_eq!(names(layout.shredding_type(&["v"])).len(), 7);
     }
 
+    /// A shredded input samples the same rows and layout as its logical values,
+    /// in a top-level column and inside a List, and keeps residual-only fields
+    /// discoverable.
+    #[test]
+    fn shredded_input_samples_like_its_logical_values() {
+        let documents: Vec<String> = (0..20_000)
+            .map(|row| match row % 4 {
+                0 => format!(r#"{{"a":{row},"b":"x{row}"}}"#),
+                1 => format!(r#"{{"a":{row},"c":{{"d":[1,2]}}}}"#),
+                2 => r#"{"a":"text","b":null}"#.to_owned(),
+                _ => "null".to_owned(),
+            })
+            .collect();
+        let json: Vec<Option<&str>> = documents
+            .iter()
+            .enumerate()
+            .map(|(row, document)| (row % 9 != 0).then_some(document.as_str()))
+            .collect();
+        let logical = variant_batch(&json);
+        let strata = vec![0; logical.num_rows()];
+        let only_a = sample(&variant_batch(&[Some(r#"{"a":1}"#)]), &[0], POLICY, 7);
+        let shredded = only_a.shred(&logical).unwrap();
+        assert_ne!(shredded.schema(), logical.schema());
+        let expected = sample(&logical, &strata, POLICY, 11);
+        assert_eq!(sample(&shredded, &strata, POLICY, 11), expected);
+        assert!(names(expected.shredding_type(&["v"])).contains(&"b".to_owned()));
+
+        let row: &[&str] = &[r#"{"k":1,"s":"a"}"#, r#"{"k":2,"s":"b","rare":true}"#];
+        let events = events_batch(&vec![row; 40]);
+        let path = ["events", "element", "attributes"];
+        let events_strata = vec![0; events.num_rows()];
+        let only_k = sample(&events_batch(&[&[r#"{"k":1}"#]]), &[0], POLICY, 7);
+        assert_eq!(names(only_k.shredding_type(&path)), ["k"]);
+        let shredded = only_k.shred(&events).unwrap();
+        assert_eq!(
+            sample(&shredded, &events_strata, POLICY, 7),
+            sample(&events, &events_strata, POLICY, 7)
+        );
+    }
+
     /// At the cap, children are kept by estimated rows covered, not raw sampled counts.
     #[test]
     fn cap_ranks_by_rows_covered() {
@@ -1546,11 +1606,10 @@ mod tests {
         let layout = sample(&variant_batch(&[Some(r#"{"a":1}"#)]), &[0], POLICY, 7);
         let later = variant_batch(&[Some(r#"{"a":"text"}"#), Some(r#"{"a":[1,2]}"#), None]);
         let shredded = layout.shred(&later).unwrap();
-        let logical: ArrayRef = parquet::variant::unshred_variant(
-            &VariantArray::try_new(shredded.column(0).as_ref()).unwrap(),
-        )
-        .unwrap()
-        .into();
+        let logical: ArrayRef =
+            unshred_variant(&VariantArray::try_new(shredded.column(0).as_ref()).unwrap())
+                .unwrap()
+                .into();
         let json = parquet::variant::variant_to_json(&logical).unwrap();
         assert_eq!(json.iter().collect::<Vec<_>>(), [
             Some(r#"{"a":"text"}"#),
